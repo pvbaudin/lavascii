@@ -88,6 +88,21 @@ impl Pool {
     }
 }
 
+/// A tiny, short-lived speck of wax flung off during a merge or split. It
+/// shrinks over its lifetime and contributes to the field like everything
+/// else, so it reads as a stringy filament of goo rather than a hard particle.
+#[derive(Clone)]
+struct Droplet {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    r0: f32,
+    temp: f32,
+    age: f32,
+    ttl: f32,
+}
+
 struct World {
     w: usize,
     h: usize,
@@ -95,6 +110,7 @@ struct World {
     target: usize,
     blobs: Vec<Blob>,
     pools: Vec<Pool>,
+    droplets: Vec<Droplet>,
     rng: Rng,
     t: f32,
 }
@@ -108,6 +124,7 @@ impl World {
             target: 3,
             blobs: Vec::new(),
             pools: Vec::new(),
+            droplets: Vec::new(),
             rng: Rng::new(seed),
             t: 0.0,
         };
@@ -253,9 +270,38 @@ impl World {
             }
         }
 
+        // Advance goo droplets: drift, gently follow buoyancy, shrink, expire.
+        for d in &mut self.droplets {
+            d.age += dt;
+            let buoy = (d.temp - 0.5) * BUOY * 0.6;
+            d.vy -= buoy * dt;
+            d.vx *= (1.0 - DAMP_H * dt).max(0.0);
+            d.vy *= (1.0 - DAMP_V * dt).max(0.0);
+            d.x += d.vx * dt;
+            d.y += d.vy * dt;
+        }
+        self.droplets.retain(|d| d.age < d.ttl);
+
         self.merge_pass();
         self.split_pass();
         self.enforce_count();
+    }
+
+    fn spawn_goo(&mut self, x: f32, y: f32, temp: f32, base_r: f32, n: usize, spread: f32) {
+        for _ in 0..n {
+            let ang = self.rng.range(0.0, 6.28);
+            let spd = self.rng.range(0.3, 1.0) * spread;
+            self.droplets.push(Droplet {
+                x,
+                y,
+                vx: ang.cos() * spd,
+                vy: ang.sin() * spd / ASPECT,
+                r0: (base_r * self.rng.range(0.35, 0.6)).clamp(1.2, self.max_r * 0.5),
+                temp,
+                age: 0.0,
+                ttl: self.rng.range(0.5, 1.1),
+            });
+        }
     }
 
     /// Merge overlapping blobs, conserving area (and blending temperature by
@@ -283,8 +329,11 @@ impl World {
                         temp: (a.temp * aa + b.temp * ba) / sum,
                         phase: a.phase,
                     };
+                    // A little splash of goo squeezed out at the contact point.
+                    let (cx, cy, ct, cr) = (nb.x, nb.y, nb.temp, nb.r);
                     self.blobs[i] = nb;
                     self.blobs.swap_remove(j);
+                    self.spawn_goo(cx, cy, ct, cr, 3, 3.0);
                     merged = true;
                 } else {
                     j += 1;
@@ -346,6 +395,8 @@ impl World {
             temp: b.temp,
             phase: self.rng.range(0.0, 6.28),
         });
+        // Stringy filament left behind between the two halves.
+        self.spawn_goo(b.x, b.y, b.temp, b.r, 2, 1.4);
     }
 
     fn enforce_count(&mut self) {
@@ -377,6 +428,17 @@ impl World {
             let w = kernel(dx * dx + dy * dy, p.r);
             field += w;
             twsum += w * p.temp;
+        }
+        for d in &self.droplets {
+            let r = d.r0 * (1.0 - d.age / d.ttl); // shrinks as it ages
+            if r <= 0.1 {
+                continue;
+            }
+            let dx = col - d.x;
+            let dy = (row - d.y) * ASPECT;
+            let w = kernel(dx * dx + dy * dy, r);
+            field += w;
+            twsum += w * d.temp;
         }
         let temp = if field > 1e-4 { twsum / field } else { 0.5 };
         (field, temp)
