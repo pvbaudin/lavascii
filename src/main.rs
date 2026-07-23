@@ -32,7 +32,7 @@ const DAMP_H: f32 = 1.5; // horizontal velocity damping (1/s)
 const WOBBLE: f32 = 3.5; // horizontal wander acceleration
 const HOT: f32 = 0.92; // temperature of a rising (hot) blob
 const COLD: f32 = 0.08; // temperature of a sinking (cold) blob
-const EASE: f32 = 2.5; // radius easing rate (1/s) — smooths merges/splits
+const EASE: f32 = 1.6; // radius easing rate (1/s) — smooths merges/melts/births
 const COHESION: f32 = 6.0; // like-temp attraction that draws blobs together
 const VISC: f32 = 2.5; // relative-velocity damping between close blobs
 
@@ -361,9 +361,11 @@ impl World {
     }
 
     /// Vertical reach of a pool's wobbling surface, in rows. Absorption happens
-    /// once a blob has sunk this far into the top or bottom band.
+    /// once a blob has sunk this far into the top or bottom band, and new blobs
+    /// are born deep inside this band so their emergence is hidden until they
+    /// rise/fall clear of the pool.
     fn band(&self) -> f32 {
-        (self.max_r / ASPECT * 0.6).max(2.5)
+        (self.max_r / ASPECT * 0.8).max(3.0)
     }
 
     /// The lava-lamp cycle. A hot riser that reaches the cold top pool is
@@ -401,31 +403,34 @@ impl World {
     }
 
     /// Birth a blob from a pool: a hot riser from the bottom, or a cold drip
-    /// from the top. It starts just inside the pool surface with a nudge in its
-    /// travel direction, plus a little goo to sell the pinch-off.
+    /// from the top. The blob is born *deep inside* the pool body — right at
+    /// the screen edge, where the pool's own field masks it — and starts small,
+    /// then grows and drifts out. So it isn't a speck that pops into view at the
+    /// border; it oozes up (or down) out of the pool as the neck to it thins.
+    /// No goo splash: the emergence itself is the effect.
     fn emit(&mut self, hot: bool) {
-        let tb = self.band();
         let (w, h) = (self.w as f32, self.h as f32);
         let m = self.max_r.min(w * 0.4);
         let x = self.rng.range(m, (w - m).max(m + 0.1));
         let r = self.rng.range(self.max_r * 0.55, self.max_r * 0.95);
         let (y, vy, temp) = if hot {
-            (h - tb - 1.0, self.rng.range(-1.5, -0.5), HOT)
+            (h - 0.5, self.rng.range(-0.6, -0.2), HOT) // deep in the hot pool
         } else {
-            (tb + 1.0, self.rng.range(0.5, 1.5), COLD)
+            (0.5, self.rng.range(0.2, 0.6), COLD) // deep in the cold pool
         };
         self.blobs.push(Blob {
             x,
             y,
-            vx: self.rng.range(-1.2, 1.2),
+            vx: self.rng.range(-0.8, 0.8),
             vy,
-            r: MIN_RADIUS, // grows out of the pool
+            // Starts small enough to stay hidden inside the pool, grows into
+            // full size as it emerges.
+            r: (r * 0.35).min(self.band() * ASPECT * 0.5),
             rt: r,
             temp,
             phase: self.rng.range(0.0, 6.28),
             dying: false,
         });
-        self.spawn_goo(x, y, temp, r, 2, 1.4);
     }
 
     /// Merge overlapping blobs, conserving area (and blending temperature by
