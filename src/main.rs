@@ -24,7 +24,7 @@ use crossterm::{
 const ASPECT: f32 = 2.0;
 
 // ---- tunables -------------------------------------------------------------
-const ABS_MAX_RADIUS: f32 = 16.0; // hard upper size cap (column units)
+const ABS_MAX_RADIUS: f32 = 26.0; // hard upper size cap (column units)
 const MIN_RADIUS: f32 = 2.5; // never shrink a blob below this
 const BUOY: f32 = 16.0; // buoyancy acceleration scale
 const DAMP_V: f32 = 1.4; // vertical velocity damping (1/s)
@@ -138,9 +138,9 @@ impl World {
     /// giant blobs that don't fit vertically.
     fn recompute_layout(&mut self) {
         let metric = (self.w as f32).min(self.h as f32 * ASPECT);
-        self.max_r = (metric * 0.16).clamp(MIN_RADIUS, ABS_MAX_RADIUS);
+        self.max_r = (metric * 0.23).clamp(MIN_RADIUS, ABS_MAX_RADIUS);
         let area = (self.w * self.h) as f32;
-        self.target = ((area / 950.0) as usize).clamp(3, 9);
+        self.target = ((area / 520.0) as usize).clamp(5, 16);
         self.rebuild_pools();
     }
 
@@ -185,7 +185,7 @@ impl World {
         for _ in 0..self.target {
             let y = self.rng.range(self.max_r, self.h as f32 - self.max_r);
             let temp = 1.0 - y / self.h as f32; // hot near the bottom
-            let r = self.rng.range(self.max_r * 0.5, self.max_r * 0.9);
+            let r = self.rng.range(self.max_r * 0.65, self.max_r * 1.0);
             self.blobs.push(Blob {
                 x: self.rng.range(self.max_r, self.w as f32 - self.max_r),
                 y,
@@ -513,10 +513,9 @@ fn render_ansi(world: &World, buf: &mut String) {
         for col in 0..world.w {
             let (field, temp) = world.sample(col as f32 + 0.5, row as f32 + 0.5);
             if field < FIELD_LO {
-                if last != Some(BG) {
-                    buf.push_str("\x1b[38;2;12;6;18m");
-                    last = Some(BG);
-                }
+                // Empty space: a plain blank keeps the terminal's own
+                // background — we never paint or colour it. (A space shows no
+                // foreground ink, so leaving the last fg colour set is fine.)
                 buf.push(' ');
                 continue;
             }
@@ -537,9 +536,6 @@ fn render_ansi(world: &World, buf: &mut String) {
         }
     }
 }
-
-/// Sentinel colour marking "background escape already emitted".
-const BG: (u8, u8, u8) = (12, 6, 18);
 
 /// Plain (colourless) render for `--test`, so the shape can be eyeballed
 /// without a live terminal.
@@ -604,8 +600,8 @@ fn run_interactive() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     out.execute(terminal::EnterAlternateScreen)?;
     out.execute(cursor::Hide)?;
-    // Solid dark background, cleared once.
-    out.write_all(b"\x1b[48;2;8;8;16m\x1b[2J")?;
+    // Clear the alternate screen using the terminal's own default background.
+    out.write_all(b"\x1b[2J")?;
     out.flush()?;
 
     let (mut w, mut h) = terminal::size().map(|(c, r)| (c as usize, r as usize))?;
