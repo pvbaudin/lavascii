@@ -35,6 +35,7 @@ const COLD: f32 = 0.08; // temperature of a sinking (cold) blob
 const EASE: f32 = 1.6; // radius easing rate (1/s) — smooths merges/melts/births
 const COHESION: f32 = 6.0; // like-temp attraction that draws blobs together
 const VISC: f32 = 2.5; // relative-velocity damping between close blobs
+const MELT_PULL: f32 = 3.0; // how fast a dying blob flows toward its sink point
 
 /// A tiny, dependency-free xorshift PRNG. Good enough for jitter and phases.
 struct Rng(u64);
@@ -71,7 +72,9 @@ struct Blob {
     rt: f32, // target radius
     temp: f32, // 0 = cold, 1 = hot
     phase: f32, // personal wobble phase
-    dying: bool, // being absorbed into a pool: melt to nothing, then remove
+    dying: bool, // melting into a pool or a bigger blob, then remove
+    sx: f32, // sink target — while dying the blob flows toward here as it melts
+    sy: f32,
 }
 
 /// A slab of the top or bottom pool — a big metaball whose surface bobs.
@@ -93,21 +96,6 @@ impl Pool {
     }
 }
 
-/// A tiny, short-lived speck of wax flung off during a merge or split. It
-/// shrinks over its lifetime and contributes to the field like everything
-/// else, so it reads as a stringy filament of goo rather than a hard particle.
-#[derive(Clone)]
-struct Droplet {
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
-    r0: f32,
-    temp: f32,
-    age: f32,
-    ttl: f32,
-}
-
 struct World {
     w: usize,
     h: usize,
@@ -115,7 +103,6 @@ struct World {
     target: usize,
     blobs: Vec<Blob>,
     pools: Vec<Pool>,
-    droplets: Vec<Droplet>,
     rng: Rng,
     t: f32,
     cycles: u32, // total pool absorptions — a liveness counter for --test
@@ -132,7 +119,6 @@ impl World {
             target: 3,
             blobs: Vec::new(),
             pools: Vec::new(),
-            droplets: Vec::new(),
             rng: Rng::new(seed),
             t: 0.0,
             cycles: 0,
@@ -211,6 +197,8 @@ impl World {
                 temp: if hot { HOT } else { COLD },
                 phase: self.rng.range(0.0, 6.28),
                 dying: false,
+                sx: 0.0,
+                sy: 0.0,
             });
         }
     }
@@ -247,8 +235,13 @@ impl World {
             // Radius glides toward its target so merges grow, splits shrink,
             // and absorbed blobs melt away smoothly rather than popping.
             b.r += (b.rt - b.r) * (EASE * dt).min(1.0);
-            // A dying blob is dissolving into a pool: no forces, just melt.
+            // A dying blob is melting into its sink target (a pool edge, or the
+            // blob it's merging with): flow toward that point as it shrinks, so
+            // it pours in rather than vanishing at its own position.
             if b.dying {
+                let k = (MELT_PULL * dt).min(1.0);
+                b.x += (b.sx - b.x) * k;
+                b.y += (b.sy - b.y) * k;
                 continue;
             }
             // Temperature is fixed while a blob is in flight — it's set when the
@@ -282,38 +275,8 @@ impl World {
         self.blobs.retain(|b| !(b.dying && b.r < 0.5));
 
         self.pool_exchange();
-
-        // Advance goo droplets: drift, gently follow buoyancy, shrink, expire.
-        for d in &mut self.droplets {
-            d.age += dt;
-            let buoy = (d.temp - 0.5) * BUOY * 0.6;
-            d.vy -= buoy * dt;
-            d.vx *= (1.0 - DAMP_H * dt).max(0.0);
-            d.vy *= (1.0 - DAMP_V * dt).max(0.0);
-            d.x += d.vx * dt;
-            d.y += d.vy * dt;
-        }
-        self.droplets.retain(|d| d.age < d.ttl);
-
         self.merge_pass();
         self.enforce_count();
-    }
-
-    fn spawn_goo(&mut self, x: f32, y: f32, temp: f32, base_r: f32, n: usize, spread: f32) {
-        for _ in 0..n {
-            let ang = self.rng.range(0.0, 6.28);
-            let spd = self.rng.range(0.3, 1.0) * spread;
-            self.droplets.push(Droplet {
-                x,
-                y,
-                vx: ang.cos() * spd,
-                vy: ang.sin() * spd / ASPECT,
-                r0: (base_r * self.rng.range(0.35, 0.6)).clamp(1.2, self.max_r * 0.5),
-                temp,
-                age: 0.0,
-                ttl: self.rng.range(0.5, 1.1),
-            });
-        }
     }
 
     /// Gentle cohesion between like-temperature blobs that are close enough to
@@ -386,10 +349,12 @@ impl World {
             if b.temp > 0.5 && b.y <= tb {
                 b.dying = true;
                 b.rt = 0.0;
+                (b.sx, b.sy) = (b.x, -1.0); // flow up into the cold pool
                 emit_cold += 1;
             } else if b.temp < 0.5 && b.y >= h - tb {
                 b.dying = true;
                 b.rt = 0.0;
+                (b.sx, b.sy) = (b.x, h + 1.0); // flow down into the hot pool
                 emit_hot += 1;
             }
         }
@@ -430,54 +395,54 @@ impl World {
             temp,
             phase: self.rng.range(0.0, 6.28),
             dying: false,
+            sx: 0.0,
+            sy: 0.0,
         });
     }
 
-    /// Merge overlapping blobs, conserving area (and blending temperature by
-    /// area) — the metaball neck between them has already been drawn goopy.
+    /// Merge overlapping like-temperature blobs. The *smaller* blob doesn't
+    /// vanish at its own spot — it's marked dying with its sink point set to the
+    /// larger blob's centre, so it flows into the larger one (which grows to the
+    /// combined, area-conserving size) and pours in. Opposite-temperature blobs
+    /// never fuse (they'd average to neutral buoyancy and stall mid-lamp); they
+    /// just pass through each other goopily via the field.
     fn merge_pass(&mut self) {
-        let mut i = 0;
-        while i < self.blobs.len() {
-            let mut j = i + 1;
-            let mut merged = false;
-            while j < self.blobs.len() {
+        let n = self.blobs.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if self.blobs[i].dying || self.blobs[j].dying {
+                    continue;
+                }
                 let (a, b) = (&self.blobs[i], &self.blobs[j]);
+                if (a.temp - b.temp).abs() >= 0.4 {
+                    continue;
+                }
                 let dx = a.x - b.x;
                 let dy = (a.y - b.y) * ASPECT;
                 let dist = (dx * dx + dy * dy).sqrt();
-                let combined_r = (a.r * a.r + b.r * b.r).sqrt();
-                // Only fuse like-temperature wax (both rising or both sinking).
-                // A hot and a cold blob must NOT average to neutral buoyancy —
-                // that's what stranded them in the middle. They pass through
-                // each other goopily via the field instead.
-                let alike = (a.temp - b.temp).abs() < 0.4 && !a.dying && !b.dying;
-                if alike && dist < (a.r + b.r) * 0.45 && combined_r <= self.max_r * 1.02 {
-                    let (aa, ba) = (a.r * a.r, b.r * b.r);
-                    let sum = aa + ba;
-                    let nb = Blob {
-                        x: (a.x * aa + b.x * ba) / sum,
-                        y: (a.y * aa + b.y * ba) / sum,
-                        vx: (a.vx * aa + b.vx * ba) / sum,
-                        vy: (a.vy * aa + b.vy * ba) / sum,
-                        r: a.r.max(b.r), // start at the larger, grow into...
-                        rt: combined_r,  // ...the combined size
-                        temp: (a.temp * aa + b.temp * ba) / sum,
-                        phase: a.phase,
-                        dying: false,
-                    };
-                    // A little splash of goo squeezed out at the contact point.
-                    let (cx, cy, ct, cr) = (nb.x, nb.y, nb.temp, nb.r);
-                    self.blobs[i] = nb;
-                    self.blobs.swap_remove(j);
-                    self.spawn_goo(cx, cy, ct, cr, 2, 2.0);
-                    self.merges += 1;
-                    merged = true;
-                } else {
-                    j += 1;
+                let combined = (a.r * a.r + b.r * b.r).sqrt();
+                if dist >= (a.r + b.r) * 0.45 || combined > self.max_r * 1.02 {
+                    continue;
                 }
-            }
-            if !merged {
-                i += 1;
+                // The larger absorbs the smaller.
+                let (bi, si) = if a.r >= b.r { (i, j) } else { (j, i) };
+                let big_a = self.blobs[bi].r * self.blobs[bi].r;
+                let small = self.blobs[si].clone();
+                let small_a = small.r * small.r;
+                let sum = big_a + small_a;
+                let (bx, by) = (self.blobs[bi].x, self.blobs[bi].y);
+                {
+                    let big = &mut self.blobs[bi];
+                    big.temp = (big.temp * big_a + small.temp * small_a) / sum;
+                    big.vx = (big.vx * big_a + small.vx * small_a) / sum;
+                    big.vy = (big.vy * big_a + small.vy * small_a) / sum;
+                    big.rt = combined; // grow to hold both, over the ease time
+                }
+                let sm = &mut self.blobs[si];
+                sm.dying = true;
+                sm.rt = 0.0;
+                (sm.sx, sm.sy) = (bx, by); // flow into the larger blob
+                self.merges += 1;
             }
         }
     }
@@ -518,17 +483,6 @@ impl World {
             let w = kernel(dx * dx + dy * dy, p.r);
             field += w;
             twsum += w * p.temp;
-        }
-        for d in &self.droplets {
-            let r = d.r0 * (1.0 - d.age / d.ttl); // shrinks as it ages
-            if r <= 0.1 {
-                continue;
-            }
-            let dx = col - d.x;
-            let dy = (row - d.y) * ASPECT;
-            let w = kernel(dx * dx + dy * dy, r);
-            field += w;
-            twsum += w * d.temp;
         }
         let temp = if field > 1e-4 { twsum / field } else { 0.5 };
         (field, temp)
