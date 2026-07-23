@@ -28,11 +28,39 @@ cargo build --release   # -> target/release/lavalamp
 ## Run
 
 ```sh
-lavalamp
+lavalamp                                  # defaults
+lavalamp --scheme ocean --speed 0.6       # calm blue lamp
+lavalamp -c ember -d 1.5 -f 60            # busy warm lamp at 60fps
+lavalamp --scheme rainbow --ramp blocks   # solid-block rainbow
+lavalamp --mono                           # no color, just glyphs
 ```
 
-Press `q`, `Esc`, or `Ctrl-C` to quit. Resize the window any time — the scene
-reflows and rescales live.
+Resize the window any time — the scene reflows and rescales live.
+
+### Options
+
+| Flag | | Description | Default |
+|---|---|---|---|
+| `-s` | `--speed <F>` | Simulation speed multiplier (0.1–5) | `1.0` |
+| `-c` | `--scheme <NAME>` | Color scheme (see below) | `magenta` |
+| `-d` | `--density <F>` | Blob-count multiplier (0.3–4) | `1.0` |
+| `-z` | `--size <F>` | Blob-size multiplier (0.3–2) | `1.0` |
+| `-f` | `--fps <N>` | Target frame rate (5–120) | `30` |
+| `-r` | `--ramp <NAME>` | Glyph ramp: `ascii`, `blocks`, `dots`, `shade` | `ascii` |
+|  | `--mono` | Monochrome (no color, just glyphs) | |
+|  | `--seed <N>` | Fixed PRNG seed (reproducible) | random |
+| `-h` | `--help` | Print help | |
+| `-V` | `--version` | Print version | |
+
+**Color schemes:** `magenta` · `ember` · `green` · `ocean` · `sunset` · `ice` · `rainbow` · `mono`
+
+### Interactive keys
+
+| Key | Action | Key | Action |
+|---|---|---|---|
+| `q` / `Esc` | quit | `space` | pause / resume |
+| `+` / `-` | faster / slower | `c` | cycle color scheme |
+| `r` | cycle glyph ramp | `m` | toggle monochrome |
 
 Preview the shape without a live terminal:
 
@@ -42,10 +70,9 @@ cargo run --release -- --test
 
 ## How it works
 
-- **Metaballs.** Every wax body (free blobs + the top/bottom pools + transient
-  goo droplets) contributes a smooth, finite-support field. Fields add, so
-  bodies fuse into goopy necks as they approach — merges and splits look
-  organic for free.
+- **Metaballs.** Every wax body (free blobs + the top/bottom pools) contributes
+  a smooth, finite-support field. Fields add, so bodies fuse into goopy necks as
+  they approach — merges look organic for free.
 - **Temperature is blended, never overwritten.** Each body carries a
   temperature; a cell's color is the field-weighted average of nearby bodies.
   Two blobs that touch *mix* their heat instead of erasing each other, so a
@@ -57,7 +84,9 @@ cargo run --release -- --test
 - **Sizing.** Maximum blob radius derives from `min(width, height·2)`, so a
   wide-but-short window stays limited by its height (no giant blobs), with a
   hard upper cap and free shrinking for small windows.
-- **Goo.** Merges squeeze out a little splash; splits leave a stringy filament.
-  Both are shrinking droplets fed back into the same field.
+- **Flow, not pops.** New blobs are born hidden inside a pool and ooze out as
+  they rise/fall; absorbed blobs melt into the pool; when a small blob merges
+  into a bigger one it flows into it rather than vanishing at its own spot.
 
-Full RGB truecolor output; a 24-bit-color terminal is recommended.
+Full RGB truecolor output; a 24-bit-color terminal is recommended (use `--mono`
+otherwise).

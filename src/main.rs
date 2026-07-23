@@ -37,6 +37,333 @@ const COHESION: f32 = 6.0; // like-temp attraction that draws blobs together
 const VISC: f32 = 2.5; // relative-velocity damping between close blobs
 const MELT_PULL: f32 = 3.0; // how fast a dying blob flows toward its sink point
 
+// ---- configuration (CLI) --------------------------------------------------
+
+/// A colour palette. Each entry maps a normalised intensity `i` (0 = faint
+/// edge, 1 = dense core) to an RGB colour, keeping the whole scene in one
+/// coherent family.
+#[derive(Clone, Copy, PartialEq)]
+enum Scheme {
+    Magenta,
+    Ember,
+    Green,
+    Ocean,
+    Sunset,
+    Ice,
+    Rainbow,
+    Mono,
+}
+
+impl Scheme {
+    const ALL: [Scheme; 8] = [
+        Scheme::Magenta,
+        Scheme::Ember,
+        Scheme::Green,
+        Scheme::Ocean,
+        Scheme::Sunset,
+        Scheme::Ice,
+        Scheme::Rainbow,
+        Scheme::Mono,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Scheme::Magenta => "magenta",
+            Scheme::Ember => "ember",
+            Scheme::Green => "green",
+            Scheme::Ocean => "ocean",
+            Scheme::Sunset => "sunset",
+            Scheme::Ice => "ice",
+            Scheme::Rainbow => "rainbow",
+            Scheme::Mono => "mono",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Scheme> {
+        Scheme::ALL.into_iter().find(|sc| sc.name() == s.to_lowercase())
+    }
+
+    fn next(self) -> Scheme {
+        let i = Scheme::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        Scheme::ALL[(i + 1) % Scheme::ALL.len()]
+    }
+
+    /// Colour for a normalised intensity in [0, 1].
+    fn color(self, i: f32) -> (u8, u8, u8) {
+        let i = i.clamp(0.0, 1.0);
+        match self {
+            Scheme::Magenta => lerp_stops(
+                &[
+                    (0.00, 55.0, 15.0, 80.0),
+                    (0.35, 120.0, 25.0, 150.0),
+                    (0.65, 195.0, 35.0, 165.0),
+                    (0.85, 240.0, 60.0, 155.0),
+                    (1.00, 255.0, 150.0, 205.0),
+                ],
+                i,
+            ),
+            Scheme::Ember => lerp_stops(
+                &[
+                    (0.00, 40.0, 12.0, 6.0),
+                    (0.35, 140.0, 35.0, 10.0),
+                    (0.65, 220.0, 80.0, 15.0),
+                    (0.85, 250.0, 150.0, 30.0),
+                    (1.00, 255.0, 235.0, 130.0),
+                ],
+                i,
+            ),
+            Scheme::Green => lerp_stops(
+                &[
+                    (0.00, 0.0, 25.0, 8.0),
+                    (0.40, 12.0, 90.0, 25.0),
+                    (0.70, 35.0, 170.0, 55.0),
+                    (0.90, 100.0, 220.0, 95.0),
+                    (1.00, 205.0, 255.0, 185.0),
+                ],
+                i,
+            ),
+            Scheme::Ocean => lerp_stops(
+                &[
+                    (0.00, 8.0, 22.0, 65.0),
+                    (0.40, 15.0, 70.0, 150.0),
+                    (0.70, 20.0, 140.0, 190.0),
+                    (0.90, 60.0, 200.0, 210.0),
+                    (1.00, 185.0, 245.0, 240.0),
+                ],
+                i,
+            ),
+            Scheme::Sunset => lerp_stops(
+                &[
+                    (0.00, 45.0, 18.0, 75.0),
+                    (0.35, 150.0, 40.0, 95.0),
+                    (0.60, 220.0, 70.0, 60.0),
+                    (0.85, 245.0, 140.0, 40.0),
+                    (1.00, 255.0, 220.0, 120.0),
+                ],
+                i,
+            ),
+            Scheme::Ice => lerp_stops(
+                &[
+                    (0.00, 30.0, 40.0, 70.0),
+                    (0.40, 60.0, 90.0, 150.0),
+                    (0.70, 120.0, 170.0, 220.0),
+                    (0.90, 190.0, 220.0, 245.0),
+                    (1.00, 240.0, 250.0, 255.0),
+                ],
+                i,
+            ),
+            // Hue sweeps with intensity: cool faint edges to warm bright cores.
+            Scheme::Rainbow => hsv(270.0 * (1.0 - i), 0.85, 0.35 + 0.6 * i),
+            Scheme::Mono => {
+                let v = (35.0 + 220.0 * i) as u8;
+                (v, v, v)
+            }
+        }
+    }
+}
+
+/// Piecewise-linear colour ramp over `(pos, r, g, b)` stops.
+fn lerp_stops(stops: &[(f32, f32, f32, f32)], i: f32) -> (u8, u8, u8) {
+    let mut k = 0;
+    while k + 1 < stops.len() && i > stops[k + 1].0 {
+        k += 1;
+    }
+    let (p0, r0, g0, b0) = stops[k];
+    let (p1, r1, g1, b1) = stops[(k + 1).min(stops.len() - 1)];
+    let f = if p1 > p0 { (i - p0) / (p1 - p0) } else { 0.0 };
+    (
+        (r0 + (r1 - r0) * f) as u8,
+        (g0 + (g1 - g0) * f) as u8,
+        (b0 + (b1 - b0) * f) as u8,
+    )
+}
+
+/// HSV (h in degrees, s/v in [0,1]) to RGB.
+fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = (h.rem_euclid(360.0)) / 60.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
+
+/// Named glyph ramps (light -> heavy).
+const RAMP_ASCII: [char; 10] = ['.', ':', '-', '=', '+', '*', 'o', '%', '#', '@'];
+const RAMP_BLOCKS: [char; 4] = ['░', '▒', '▓', '█'];
+const RAMP_DOTS: [char; 6] = ['·', ':', 'o', 'O', '0', '@'];
+const RAMP_SHADE: [char; 8] = [',', ';', 'c', 'l', 'x', 'k', 'X', 'W'];
+
+fn ramp_by_name(s: &str) -> Option<&'static [char]> {
+    match s.to_lowercase().as_str() {
+        "ascii" => Some(&RAMP_ASCII),
+        "blocks" => Some(&RAMP_BLOCKS),
+        "dots" => Some(&RAMP_DOTS),
+        "shade" => Some(&RAMP_SHADE),
+        _ => None,
+    }
+}
+
+/// Runtime configuration assembled from CLI arguments.
+#[derive(Clone, Copy)]
+struct Config {
+    speed: f32,      // simulation time multiplier
+    scheme: Scheme,  // colour palette
+    density: f32,    // blob-count multiplier
+    size: f32,       // blob-size multiplier
+    fps: u32,        // target frame rate
+    ramp: &'static [char], // glyph density ramp
+    color: bool,     // truecolor vs. plain glyphs
+    paused: bool,    // interactive pause
+    seed: u64,       // PRNG seed
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            speed: 1.0,
+            scheme: Scheme::Magenta,
+            density: 1.0,
+            size: 1.0,
+            fps: 30,
+            ramp: &RAMP_ASCII,
+            color: true,
+            paused: false,
+            seed: 0x1234_5678,
+        }
+    }
+}
+
+const HELP: &str = "\
+lavalamp — a full-color ASCII lava lamp for your terminal
+
+USAGE:
+    lavalamp [OPTIONS]
+
+OPTIONS:
+    -s, --speed <F>       Simulation speed multiplier (0.1–5)     [default: 1.0]
+    -c, --scheme <NAME>   Color scheme (see below)                [default: magenta]
+    -d, --density <F>     Blob-count multiplier (0.3–4)           [default: 1.0]
+    -z, --size <F>        Blob-size multiplier (0.3–2)            [default: 1.0]
+    -f, --fps <N>         Target frame rate (5–120)               [default: 30]
+    -r, --ramp <NAME>     Glyph ramp: ascii, blocks, dots, shade  [default: ascii]
+        --mono            Monochrome (no color, just glyphs)
+        --seed <N>        Fixed PRNG seed (reproducible)
+    -h, --help            Print this help
+    -V, --version         Print version
+
+COLOR SCHEMES:
+    magenta  ember  green  ocean  sunset  ice  rainbow  mono
+
+INTERACTIVE KEYS:
+    q / Esc     quit                 space   pause / resume
+    + / -       faster / slower      c       cycle color scheme
+    r           cycle glyph ramp     m       toggle monochrome
+
+EXAMPLES:
+    lavalamp --scheme ocean --speed 0.6
+    lavalamp -c ember -d 1.5 -f 60
+    lavalamp --scheme rainbow --ramp blocks
+";
+
+/// Fetch an option's value, supporting both `--key val` and `--key=val`.
+fn take_val(
+    args: &[String],
+    i: &mut usize,
+    inline: &Option<String>,
+    name: &str,
+) -> Result<String, String> {
+    if let Some(v) = inline {
+        Ok(v.clone())
+    } else {
+        *i += 1;
+        args.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("{name} requires a value"))
+    }
+}
+
+/// Parse CLI args into a Config. Returns Err(message) on bad input, or
+/// Ok(None) if a help/version message was printed and we should exit.
+fn parse_args() -> Result<Option<Config>, String> {
+    let mut cfg = Config { seed: seed(), ..Config::default() };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let (key, inline) = match a.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (a.clone(), None),
+        };
+        match key.as_str() {
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("lavalamp {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "-s" | "--speed" => {
+                cfg.speed = take_val(&args, &mut i, &inline, "--speed")?
+                    .parse::<f32>()
+                    .map_err(|_| "--speed must be a number")?
+                    .clamp(0.1, 5.0);
+            }
+            "-c" | "--scheme" | "--colors" | "--palette" => {
+                let v = take_val(&args, &mut i, &inline, "--scheme")?;
+                cfg.scheme = Scheme::parse(&v)
+                    .ok_or_else(|| format!("unknown scheme '{v}' (try --help)"))?;
+            }
+            "-d" | "--density" => {
+                cfg.density = take_val(&args, &mut i, &inline, "--density")?
+                    .parse::<f32>()
+                    .map_err(|_| "--density must be a number")?
+                    .clamp(0.3, 4.0);
+            }
+            "-z" | "--size" => {
+                cfg.size = take_val(&args, &mut i, &inline, "--size")?
+                    .parse::<f32>()
+                    .map_err(|_| "--size must be a number")?
+                    .clamp(0.3, 2.0);
+            }
+            "-f" | "--fps" => {
+                cfg.fps = take_val(&args, &mut i, &inline, "--fps")?
+                    .parse::<u32>()
+                    .map_err(|_| "--fps must be an integer")?
+                    .clamp(5, 120);
+            }
+            "-r" | "--ramp" | "--chars" => {
+                let v = take_val(&args, &mut i, &inline, "--ramp")?;
+                cfg.ramp = ramp_by_name(&v)
+                    .ok_or_else(|| format!("unknown ramp '{v}' (ascii|blocks|dots|shade)"))?;
+            }
+            "--mono" => cfg.color = false,
+            "--seed" => {
+                cfg.seed = take_val(&args, &mut i, &inline, "--seed")?
+                    .parse::<u64>()
+                    .map_err(|_| "--seed must be an integer")?;
+            }
+            // Internal test/diagnostic flags handled in main().
+            "--test" | "--diag" => {}
+            other => return Err(format!("unknown option '{other}' (try --help)")),
+        }
+        i += 1;
+    }
+    Ok(Some(cfg))
+}
+
 /// A tiny, dependency-free xorshift PRNG. Good enough for jitter and phases.
 struct Rng(u64);
 impl Rng {
@@ -105,13 +432,14 @@ struct World {
     pools: Vec<Pool>,
     rng: Rng,
     t: f32,
+    cfg: Config,
     cycles: u32, // total pool absorptions — a liveness counter for --test
     merges: u32, // diagnostics
     splits: u32,
 }
 
 impl World {
-    fn new(w: usize, h: usize, seed: u64) -> Self {
+    fn new(w: usize, h: usize, cfg: Config) -> Self {
         let mut world = World {
             w: w.max(1),
             h: h.max(1),
@@ -119,8 +447,9 @@ impl World {
             target: 3,
             blobs: Vec::new(),
             pools: Vec::new(),
-            rng: Rng::new(seed),
+            rng: Rng::new(cfg.seed),
             t: 0.0,
+            cfg,
             cycles: 0,
             merges: 0,
             splits: 0,
@@ -135,9 +464,12 @@ impl World {
     /// giant blobs that don't fit vertically.
     fn recompute_layout(&mut self) {
         let metric = (self.w as f32).min(self.h as f32 * ASPECT);
-        self.max_r = (metric * 0.23).clamp(MIN_RADIUS, ABS_MAX_RADIUS);
+        let size = self.cfg.size;
+        self.max_r = (metric * 0.23 * size).clamp(MIN_RADIUS, ABS_MAX_RADIUS * size.max(1.0));
         let area = (self.w * self.h) as f32;
-        self.target = ((area / 520.0) as usize).clamp(5, 16);
+        // Bigger blobs cover more area, so scale the count down as size grows.
+        let base = (area / 520.0) * self.cfg.density / (size * size);
+        self.target = (base as usize).clamp(2, 40);
         self.rebuild_pools();
     }
 
@@ -222,8 +554,22 @@ impl World {
         self.enforce_count();
     }
 
-    fn update(&mut self, dt: f32) {
-        let dt = dt.min(0.05); // clamp so a stall can't explode the sim
+    /// Advance the simulation by `real_dt` seconds of wall-clock time, scaled by
+    /// the configured speed. Large or fast steps are split into sub-steps of at
+    /// most ~20ms so the physics stays stable at any speed.
+    fn update(&mut self, real_dt: f32) {
+        if self.cfg.paused {
+            return;
+        }
+        let total = (real_dt * self.cfg.speed).min(0.25);
+        let steps = (total / 0.02).ceil().max(1.0) as usize;
+        let h = total / steps as f32;
+        for _ in 0..steps {
+            self.step(h);
+        }
+    }
+
+    fn step(&mut self, dt: f32) {
         self.t += dt;
         let (w, h) = (self.w as f32, self.h as f32);
 
@@ -505,51 +851,21 @@ fn kernel(d2: f32, r: f32) -> f32 {
 const FIELD_LO: f32 = 0.20;
 const FIELD_HI: f32 = 1.05;
 
-/// Light-to-heavy ASCII density ramp — sparse at a blob's faint edge, solid at
-/// its core. This is what gives the hand-drawn ASCII-art look.
-const RAMP: [char; 10] = ['.', ':', '-', '=', '+', '*', 'o', '%', '#', '@'];
-
 #[inline]
 fn intensity(field: f32) -> f32 {
     ((field - FIELD_LO) / (FIELD_HI - FIELD_LO)).clamp(0.0, 1.0)
 }
 
-/// Pick the ramp glyph for a given normalised intensity.
-fn ramp_char(i: f32) -> char {
-    let idx = (i * (RAMP.len() - 1) as f32).round() as usize;
-    RAMP[idx.min(RAMP.len() - 1)]
+/// Pick a ramp glyph for a normalised intensity from the chosen glyph set.
+fn ramp_char(ramp: &[char], i: f32) -> char {
+    let idx = (i * (ramp.len() - 1) as f32).round() as usize;
+    ramp[idx.min(ramp.len() - 1)]
 }
 
-/// Unified "magenta neon" palette: dim purple at the faint edges, ramping
-/// through magenta to a hot-pink core. Colour is driven by density (`i`) so
-/// the whole scene stays one coherent hue family; temperature only nudges
-/// within it (warmer wax leans pink, cooler wax leans purple).
-fn lava_color(i: f32) -> (u8, u8, u8) {
-    // stops: (pos, r, g, b)
-    const STOPS: [(f32, f32, f32, f32); 5] = [
-        (0.00, 55.0, 15.0, 80.0),    // dim purple edge
-        (0.35, 120.0, 25.0, 150.0),  // purple
-        (0.65, 195.0, 35.0, 165.0),  // magenta
-        (0.85, 240.0, 60.0, 155.0),  // hot pink
-        (1.00, 255.0, 150.0, 205.0), // pale pink core
-    ];
-    let i = i.clamp(0.0, 1.0);
-    let mut k = 0;
-    while k + 1 < STOPS.len() && i > STOPS[k + 1].0 {
-        k += 1;
-    }
-    let (p0, r0, g0, b0) = STOPS[k];
-    let (p1, r1, g1, b1) = STOPS[(k + 1).min(STOPS.len() - 1)];
-    let f = if p1 > p0 { (i - p0) / (p1 - p0) } else { 0.0 };
-    (
-        (r0 + (r1 - r0) * f) as u8,
-        (g0 + (g1 - g0) * f) as u8,
-        (b0 + (b1 - b0) * f) as u8,
-    )
-}
-
-/// Render the world into an ANSI truecolor frame (cursor is homed by caller).
+/// Render the world into an ANSI frame (cursor is homed by caller), honouring
+/// the configured colour scheme, glyph ramp and mono flag.
 fn render_ansi(world: &World, buf: &mut String) {
+    let cfg = &world.cfg;
     buf.clear();
     buf.push_str("\x1b[H"); // cursor home
     let mut last: Option<(u8, u8, u8)> = None;
@@ -564,14 +880,16 @@ fn render_ansi(world: &World, buf: &mut String) {
                 continue;
             }
             let dens = intensity(field);
-            let ch = ramp_char(dens);
-            // Density drives the glyph; colour follows density but drifts a
-            // little with temperature to keep the wax alive within one hue.
-            let ci = (dens + (temp - 0.5) * 0.30).clamp(0.0, 1.0);
-            let c = lava_color(ci);
-            if last != Some(c) {
-                buf.push_str(&format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2));
-                last = Some(c);
+            let ch = ramp_char(cfg.ramp, dens);
+            if cfg.color {
+                // Density drives the glyph; colour follows density but drifts a
+                // little with temperature to keep the wax alive within one hue.
+                let ci = (dens + (temp - 0.5) * 0.30).clamp(0.0, 1.0);
+                let c = cfg.scheme.color(ci);
+                if last != Some(c) {
+                    buf.push_str(&format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2));
+                    last = Some(c);
+                }
             }
             buf.push(ch);
         }
@@ -584,19 +902,9 @@ fn render_ansi(world: &World, buf: &mut String) {
 /// Plain (colourless) render for `--test`, so the shape can be eyeballed
 /// without a live terminal.
 fn render_plain(world: &World) -> String {
-    let mut s = String::new();
-    for row in 0..world.h {
-        for col in 0..world.w {
-            let (field, _t) = world.sample(col as f32 + 0.5, row as f32 + 0.5);
-            if field < FIELD_LO {
-                s.push(' ');
-            } else {
-                s.push(ramp_char(intensity(field)));
-            }
-        }
-        s.push('\n');
-    }
-    s
+    String::from_iter(glyph_grid(world).chunks(world.w.max(1)).flat_map(|row| {
+        row.iter().copied().chain(std::iter::once('\n'))
+    }))
 }
 
 /// Flat row-major glyph grid, for frame-to-frame churn diagnostics.
@@ -608,7 +916,7 @@ fn glyph_grid(world: &World) -> Vec<char> {
             g.push(if field < FIELD_LO {
                 ' '
             } else {
-                ramp_char(intensity(field))
+                ramp_char(world.cfg.ramp, intensity(field))
             });
         }
     }
@@ -629,7 +937,7 @@ fn grid_str(g: &[char], w: usize, h: usize) -> String {
 /// dump of the frames around the worst spike so the culprit is visible.
 fn run_diag() {
     let (w, h) = (80usize, 40usize);
-    let mut world = World::new(w, h, 0x1234_5678);
+    let mut world = World::new(w, h, Config { seed: 0x1234_5678, ..Config::default() });
     for _ in 0..150 {
         world.update(1.0 / 30.0);
     }
@@ -706,7 +1014,7 @@ fn seed() -> u64 {
 
 fn run_test() {
     let (w, h) = (80usize, 40usize);
-    let mut world = World::new(w, h, 0x1234_5678);
+    let mut world = World::new(w, h, Config { seed: 0x1234_5678, ..Config::default() });
     // Warm up so blobs are mid-cycle.
     for _ in 0..400 {
         world.update(0.033);
@@ -755,7 +1063,7 @@ fn run_test() {
     );
 
     // Sanity on a wide-short window: blobs must stay small.
-    let mut wide = World::new(200, 12, 0x9);
+    let mut wide = World::new(200, 12, Config { seed: 0x9, ..Config::default() });
     for _ in 0..100 {
         wide.update(0.033);
     }
@@ -765,7 +1073,7 @@ fn run_test() {
     );
 
     // Resize check: widening must NOT stretch blobs or the arrangement.
-    let mut rz = World::new(80, 40, 0x55);
+    let mut rz = World::new(80, 40, Config { seed: 0x55, ..Config::default() });
     for _ in 0..200 {
         rz.update(0.033);
     }
@@ -783,7 +1091,7 @@ fn run_test() {
     );
 }
 
-fn run_interactive() -> io::Result<()> {
+fn run_interactive(cfg: Config) -> io::Result<()> {
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
     out.execute(terminal::EnterAlternateScreen)?;
@@ -793,10 +1101,9 @@ fn run_interactive() -> io::Result<()> {
     out.flush()?;
 
     let (mut w, mut h) = terminal::size().map(|(c, r)| (c as usize, r as usize))?;
-    let mut world = World::new(w, h, seed());
+    let mut world = World::new(w, h, cfg);
     let mut buf = String::with_capacity(w * h * 4);
     let mut last = Instant::now();
-    let frame = Duration::from_millis(33);
 
     let result = (|| -> io::Result<()> {
         loop {
@@ -804,11 +1111,25 @@ fn run_interactive() -> io::Result<()> {
             while event::poll(Duration::from_millis(0))? {
                 match event::read()? {
                     Event::Key(KeyEvent { code, modifiers, .. }) => {
-                        let quit = matches!(code, KeyCode::Char('q') | KeyCode::Esc)
-                            || (modifiers.contains(KeyModifiers::CONTROL)
-                                && code == KeyCode::Char('c'));
-                        if quit {
-                            return Ok(());
+                        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+                        match code {
+                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('c') if ctrl => return Ok(()),
+                            // Live tuning.
+                            KeyCode::Char(' ') => world.cfg.paused = !world.cfg.paused,
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
+                                world.cfg.speed = (world.cfg.speed * 1.25).min(5.0);
+                            }
+                            KeyCode::Char('-') | KeyCode::Char('_') => {
+                                world.cfg.speed = (world.cfg.speed / 1.25).max(0.1);
+                            }
+                            KeyCode::Char('c') => world.cfg.scheme = world.cfg.scheme.next(),
+                            KeyCode::Char('m') => world.cfg.color = !world.cfg.color,
+                            KeyCode::Char('r') => {
+                                world.cfg.ramp = next_ramp(world.cfg.ramp);
+                                out.write_all(b"\x1b[2J")?; // ramps differ in width
+                            }
+                            _ => {}
                         }
                     }
                     Event::Resize(nc, nr) => {
@@ -830,6 +1151,7 @@ fn run_interactive() -> io::Result<()> {
             out.write_all(buf.as_bytes())?;
             out.flush()?;
 
+            let frame = Duration::from_micros(1_000_000 / world.cfg.fps.max(1) as u64);
             let elapsed = now.elapsed();
             if elapsed < frame {
                 std::thread::sleep(frame - elapsed);
@@ -845,18 +1167,35 @@ fn run_interactive() -> io::Result<()> {
     result
 }
 
+/// Cycle through the named glyph ramps (for the interactive `r` key).
+fn next_ramp(cur: &'static [char]) -> &'static [char] {
+    let ramps: [&'static [char]; 4] = [&RAMP_ASCII, &RAMP_BLOCKS, &RAMP_DOTS, &RAMP_SHADE];
+    let i = ramps.iter().position(|r| std::ptr::eq(*r, cur)).unwrap_or(0);
+    ramps[(i + 1) % ramps.len()]
+}
+
 fn main() {
-    if std::env::args().any(|a| a == "--test") {
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.iter().any(|a| a == "--test") {
         run_test();
         return;
     }
-    if std::env::args().any(|a| a == "--diag") {
+    if raw.iter().any(|a| a == "--diag") {
         run_diag();
         return;
     }
-    if let Err(e) = run_interactive() {
-        let _ = terminal::disable_raw_mode();
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match parse_args() {
+        Ok(Some(cfg)) => {
+            if let Err(e) = run_interactive(cfg) {
+                let _ = terminal::disable_raw_mode();
+                eprintln!("lavalamp: error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Ok(None) => {} // --help / --version already printed
+        Err(msg) => {
+            eprintln!("lavalamp: {msg}");
+            std::process::exit(2);
+        }
     }
 }
