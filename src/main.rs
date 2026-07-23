@@ -216,16 +216,19 @@ impl World {
     }
 
     fn resize(&mut self, w: usize, h: usize) {
-        let (ow, oh) = (self.w as f32, self.h as f32);
         self.w = w.max(1);
         self.h = h.max(1);
-        let (sx, sy) = (self.w as f32 / ow, self.h as f32 / oh);
         self.recompute_layout();
-        // Rescale existing blobs so the scene stretches with the window.
+        // Blobs keep their absolute cell positions — the scene does NOT stretch
+        // with the window. Widening just reveals more room; narrowing clamps
+        // blobs back inside. Radius is only ever clamped *down* to the new cap
+        // (which shrinks for small windows); blobs never get stretched wider.
+        let (w, h) = (self.w as f32, self.h as f32);
         for b in &mut self.blobs {
-            b.x = (b.x * sx).clamp(0.0, self.w as f32);
-            b.y = (b.y * sy).clamp(0.0, self.h as f32);
+            b.rt = b.rt.min(self.max_r).max(MIN_RADIUS);
             b.r = b.r.min(self.max_r).max(MIN_RADIUS);
+            b.x = b.x.clamp(b.r * 0.3, (w - b.r * 0.3).max(b.r * 0.3));
+            b.y = b.y.clamp(0.5, h - 0.5);
         }
         // Keep the blob population sensible for the new size.
         self.enforce_count();
@@ -800,6 +803,24 @@ fn run_test() {
     println!(
         "== wide-short 200x12: max_r {:.1} (should be small) ==",
         wide.max_r
+    );
+
+    // Resize check: widening must NOT stretch blobs or the arrangement.
+    let mut rz = World::new(80, 40, 0x55);
+    for _ in 0..200 {
+        rz.update(0.033);
+    }
+    let before: Vec<(f32, f32, f32)> = rz.blobs.iter().map(|b| (b.x, b.y, b.r)).collect();
+    let mr_before = rz.max_r;
+    rz.resize(160, 40); // double the width, same height
+    let stretched = rz
+        .blobs
+        .iter()
+        .zip(&before)
+        .any(|(b, &(ox, _, or))| (b.x - ox).abs() > 0.01 || (b.r - or).abs() > 0.01);
+    println!(
+        "== resize 80x40 -> 160x40: max_r {:.1} -> {:.1} (unchanged), positions/radii stretched: {} (should be false) ==",
+        mr_before, rz.max_r, stretched
     );
 }
 
