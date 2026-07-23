@@ -456,45 +456,52 @@ fn kernel(d2: f32, r: f32) -> f32 {
     }
 }
 
-/// Map temperature (0 cold .. 1 hot) to an RGB colour along a lava gradient.
-fn temp_color(t: f32) -> (u8, u8, u8) {
+// Field magnitude below FIELD_LO is empty space; at/above FIELD_HI is the
+// dense molten core. Everything renders as a normalised intensity in between.
+const FIELD_LO: f32 = 0.20;
+const FIELD_HI: f32 = 1.05;
+
+/// Light-to-heavy ASCII density ramp — sparse at a blob's faint edge, solid at
+/// its core. This is what gives the hand-drawn ASCII-art look.
+const RAMP: [char; 10] = ['.', ':', '-', '=', '+', '*', 'o', '%', '#', '@'];
+
+#[inline]
+fn intensity(field: f32) -> f32 {
+    ((field - FIELD_LO) / (FIELD_HI - FIELD_LO)).clamp(0.0, 1.0)
+}
+
+/// Pick the ramp glyph for a given normalised intensity.
+fn ramp_char(i: f32) -> char {
+    let idx = (i * (RAMP.len() - 1) as f32).round() as usize;
+    RAMP[idx.min(RAMP.len() - 1)]
+}
+
+/// Unified "magenta neon" palette: dim purple at the faint edges, ramping
+/// through magenta to a hot-pink core. Colour is driven by density (`i`) so
+/// the whole scene stays one coherent hue family; temperature only nudges
+/// within it (warmer wax leans pink, cooler wax leans purple).
+fn lava_color(i: f32) -> (u8, u8, u8) {
     // stops: (pos, r, g, b)
     const STOPS: [(f32, f32, f32, f32); 5] = [
-        (0.00, 28.0, 42.0, 130.0),   // deep blue
-        (0.35, 120.0, 40.0, 170.0),  // purple
-        (0.60, 215.0, 45.0, 110.0),  // magenta
-        (0.82, 245.0, 110.0, 30.0),  // orange
-        (1.00, 255.0, 205.0, 70.0),  // hot yellow
+        (0.00, 55.0, 15.0, 80.0),    // dim purple edge
+        (0.35, 120.0, 25.0, 150.0),  // purple
+        (0.65, 195.0, 35.0, 165.0),  // magenta
+        (0.85, 240.0, 60.0, 155.0),  // hot pink
+        (1.00, 255.0, 150.0, 205.0), // pale pink core
     ];
-    let t = t.clamp(0.0, 1.0);
-    let mut i = 0;
-    while i + 1 < STOPS.len() && t > STOPS[i + 1].0 {
-        i += 1;
+    let i = i.clamp(0.0, 1.0);
+    let mut k = 0;
+    while k + 1 < STOPS.len() && i > STOPS[k + 1].0 {
+        k += 1;
     }
-    let (p0, r0, g0, b0) = STOPS[i];
-    let (p1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
-    let f = if p1 > p0 { (t - p0) / (p1 - p0) } else { 0.0 };
+    let (p0, r0, g0, b0) = STOPS[k];
+    let (p1, r1, g1, b1) = STOPS[(k + 1).min(STOPS.len() - 1)];
+    let f = if p1 > p0 { (i - p0) / (p1 - p0) } else { 0.0 };
     (
         (r0 + (r1 - r0) * f) as u8,
         (g0 + (g1 - g0) * f) as u8,
         (b0 + (b1 - b0) * f) as u8,
     )
-}
-
-/// Pick a glyph and a brightness scale from the field magnitude. Softer edges
-/// use lighter shade blocks so the surface looks molten rather than hard-edged.
-fn glyph(field: f32) -> Option<(char, f32)> {
-    if field >= 0.80 {
-        Some(('█', 1.0))
-    } else if field >= 0.52 {
-        Some(('▓', 0.9))
-    } else if field >= 0.34 {
-        Some(('▒', 0.72))
-    } else if field >= 0.20 {
-        Some(('░', 0.5)) // outer glow
-    } else {
-        None
-    }
 }
 
 /// Render the world into an ANSI truecolor frame (cursor is homed by caller).
@@ -505,35 +512,34 @@ fn render_ansi(world: &World, buf: &mut String) {
     for row in 0..world.h {
         for col in 0..world.w {
             let (field, temp) = world.sample(col as f32 + 0.5, row as f32 + 0.5);
-            match glyph(field) {
-                Some((ch, bright)) => {
-                    let (r, g, b) = temp_color(temp);
-                    let c = (
-                        (r as f32 * bright) as u8,
-                        (g as f32 * bright) as u8,
-                        (b as f32 * bright) as u8,
-                    );
-                    if last != Some(c) {
-                        buf.push_str(&format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2));
-                        last = Some(c);
-                    }
-                    buf.push(ch);
+            if field < FIELD_LO {
+                if last != Some(BG) {
+                    buf.push_str("\x1b[38;2;12;6;18m");
+                    last = Some(BG);
                 }
-                None => {
-                    // background
-                    if last != Some((0, 0, 0)) {
-                        buf.push_str("\x1b[38;2;8;8;16m");
-                        last = Some((0, 0, 0));
-                    }
-                    buf.push(' ');
-                }
+                buf.push(' ');
+                continue;
             }
+            let dens = intensity(field);
+            let ch = ramp_char(dens);
+            // Density drives the glyph; colour follows density but drifts a
+            // little with temperature to keep the wax alive within one hue.
+            let ci = (dens + (temp - 0.5) * 0.30).clamp(0.0, 1.0);
+            let c = lava_color(ci);
+            if last != Some(c) {
+                buf.push_str(&format!("\x1b[38;2;{};{};{}m", c.0, c.1, c.2));
+                last = Some(c);
+            }
+            buf.push(ch);
         }
         if row + 1 < world.h {
             buf.push_str("\r\n");
         }
     }
 }
+
+/// Sentinel colour marking "background escape already emitted".
+const BG: (u8, u8, u8) = (12, 6, 18);
 
 /// Plain (colourless) render for `--test`, so the shape can be eyeballed
 /// without a live terminal.
@@ -542,9 +548,10 @@ fn render_plain(world: &World) -> String {
     for row in 0..world.h {
         for col in 0..world.w {
             let (field, _t) = world.sample(col as f32 + 0.5, row as f32 + 0.5);
-            match glyph(field) {
-                Some((ch, _)) => s.push(ch),
-                None => s.push(' '),
+            if field < FIELD_LO {
+                s.push(' ');
+            } else {
+                s.push(ramp_char(intensity(field)));
             }
         }
         s.push('\n');
