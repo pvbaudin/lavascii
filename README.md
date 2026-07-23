@@ -5,10 +5,30 @@ A full-color ASCII lava lamp for your terminal, in Rust — in the spirit of
 
 ![it goops](https://example.invalid/placeholder)
 
+## Install
+
+Build and install the `lavalamp` binary onto your PATH:
+
+```sh
+cargo install --path .
+```
+
+Then run it from anywhere:
+
+```sh
+lavalamp
+```
+
+Or grab a standalone binary without installing:
+
+```sh
+cargo build --release   # -> target/release/lavalamp
+```
+
 ## Run
 
 ```sh
-cargo run --release
+lavalamp
 ```
 
 Press `q`, `Esc`, or `Ctrl-C` to quit. Resize the window any time — the scene
