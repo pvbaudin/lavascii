@@ -26,12 +26,12 @@ const ASPECT: f32 = 2.0;
 // ---- tunables -------------------------------------------------------------
 const ABS_MAX_RADIUS: f32 = 26.0; // hard upper size cap (column units)
 const MIN_RADIUS: f32 = 2.5; // never shrink a blob below this
-const BUOY: f32 = 16.0; // buoyancy acceleration scale
-const DAMP_V: f32 = 1.4; // vertical velocity damping (1/s)
-const DAMP_H: f32 = 1.3; // horizontal velocity damping (1/s)
-const WOBBLE: f32 = 7.0; // horizontal wander acceleration
-const HEAT_RATE: f32 = 1.6; // how fast the end zones re-temperature a blob
-const NOISE: f32 = 2.2; // tiny random jitter to break symmetry
+const BUOY: f32 = 15.0; // buoyancy acceleration scale
+const DAMP_V: f32 = 1.5; // vertical velocity damping (1/s)
+const DAMP_H: f32 = 1.4; // horizontal velocity damping (1/s)
+const WOBBLE: f32 = 6.0; // horizontal wander acceleration
+const HOT: f32 = 0.92; // temperature of a rising (hot) blob
+const COLD: f32 = 0.08; // temperature of a sinking (cold) blob
 
 /// A tiny, dependency-free xorshift PRNG. Good enough for jitter and phases.
 struct Rng(u64);
@@ -113,6 +113,7 @@ struct World {
     droplets: Vec<Droplet>,
     rng: Rng,
     t: f32,
+    cycles: u32, // total pool absorptions — a liveness counter for --test
 }
 
 impl World {
@@ -127,6 +128,7 @@ impl World {
             droplets: Vec::new(),
             rng: Rng::new(seed),
             t: 0.0,
+            cycles: 0,
         };
         world.recompute_layout();
         world.spawn_initial();
@@ -182,17 +184,21 @@ impl World {
 
     fn spawn_initial(&mut self) {
         self.blobs.clear();
-        for _ in 0..self.target {
-            let y = self.rng.range(self.max_r, self.h as f32 - self.max_r);
-            let temp = 1.0 - y / self.h as f32; // hot near the bottom
-            let r = self.rng.range(self.max_r * 0.65, self.max_r * 1.0);
+        let (w, h) = (self.w as f32, self.h as f32);
+        let tb = self.band();
+        let m = self.max_r.min(w * 0.4);
+        // Half hot (already climbing), half cold (already sinking), spread over
+        // the whole column so the lamp is mid-cycle from the first frame.
+        for i in 0..self.target {
+            let hot = i % 2 == 0;
+            let r = self.rng.range(self.max_r * 0.6, self.max_r * 0.95);
             self.blobs.push(Blob {
-                x: self.rng.range(self.max_r, self.w as f32 - self.max_r),
-                y,
-                vx: self.rng.range(-2.0, 2.0),
-                vy: self.rng.range(-2.0, 2.0),
+                x: self.rng.range(m, (w - m).max(m + 0.1)),
+                y: self.rng.range(tb + 1.0, (h - tb - 1.0).max(tb + 1.1)),
+                vx: self.rng.range(-1.5, 1.5),
+                vy: if hot { -1.0 } else { 1.0 },
                 r,
-                temp: temp.clamp(0.0, 1.0),
+                temp: if hot { HOT } else { COLD },
                 phase: self.rng.range(0.0, 6.28),
             });
         }
@@ -211,9 +217,7 @@ impl World {
             b.r = b.r.min(self.max_r).max(MIN_RADIUS);
         }
         // Keep the blob population sensible for the new size.
-        while self.blobs.len() < self.target {
-            self.split_largest();
-        }
+        self.enforce_count();
     }
 
     fn update(&mut self, dt: f32) {
@@ -222,53 +226,35 @@ impl World {
         let (w, h) = (self.w as f32, self.h as f32);
 
         for b in &mut self.blobs {
-            let ny = b.y / h; // 0 top .. 1 bottom
-            // Heat exchange only bites hard in the end zones; the middle is
-            // near-adiabatic so momentum carries a blob through without
-            // equilibrating to a stuck, neutral-buoyancy temperature.
-            if ny > 0.80 {
-                b.temp += (1.0 - b.temp) * HEAT_RATE * dt;
-            } else if ny < 0.20 {
-                b.temp += (0.0 - b.temp) * HEAT_RATE * dt;
-            } else {
-                b.temp += (0.5 - b.temp) * 0.04 * dt;
-            }
-            b.temp = b.temp.clamp(0.0, 1.0);
-
-            // Buoyancy: hotter than neutral rises (screen-up is -y).
+            // Temperature is fixed while a blob is in flight — it's set when the
+            // blob is born from a pool and only ever HOT or COLD. So a blob is
+            // always decisively buoyant or heavy and can never equilibrate to a
+            // neutral, stuck-in-the-middle state.
             let buoy = (b.temp - 0.5) * BUOY;
             b.vy -= buoy * dt;
-            // Gentle horizontal wander + jitter.
-            b.vx += (self.t * 1.3 + b.phase).sin() * WOBBLE * dt;
-            b.vy += (self.rng.f32() - 0.5) * NOISE * dt;
-            b.vx += (self.rng.f32() - 0.5) * NOISE * dt;
-            // Damping.
+            // Smooth, low-frequency horizontal wander. No per-frame random
+            // jitter — that was what made touching blobs shimmer.
+            b.vx += (self.t * 0.8 + b.phase).sin() * WOBBLE * dt;
             b.vx *= (1.0 - DAMP_H * dt).max(0.0);
             b.vy *= (1.0 - DAMP_V * dt).max(0.0);
-            // Integrate.
             b.x += b.vx * dt;
             b.y += b.vy * dt;
 
-            // Side walls bounce.
-            let m = b.r * 0.4;
+            // Side walls: gentle bounce.
+            let m = b.r * 0.3;
             if b.x < m {
                 b.x = m;
-                b.vx = b.vx.abs() * 0.4;
+                b.vx = b.vx.abs() * 0.5;
             } else if b.x > w - m {
                 b.x = w - m;
-                b.vx = -b.vx.abs() * 0.4;
+                b.vx = -b.vx.abs() * 0.5;
             }
-            // Soft floor/ceiling so blobs sink into the pools without escaping.
-            let top = b.r / ASPECT * 0.4;
-            let bot = h - b.r / ASPECT * 0.4;
-            if b.y < top {
-                b.y = top;
-                b.vy = b.vy.abs() * 0.3;
-            } else if b.y > bot {
-                b.y = bot;
-                b.vy = -b.vy.abs() * 0.3;
-            }
+            // Never leave the screen; the pools turn blobs around by absorbing
+            // them (below), so there's no hard vertical wall to bounce off.
+            b.y = b.y.clamp(0.5, h - 0.5);
         }
+
+        self.pool_exchange();
 
         // Advance goo droplets: drift, gently follow buoyancy, shrink, expire.
         for d in &mut self.droplets {
@@ -304,6 +290,72 @@ impl World {
         }
     }
 
+    /// Vertical reach of a pool's wobbling surface, in rows. Absorption happens
+    /// once a blob has sunk this far into the top or bottom band.
+    fn band(&self) -> f32 {
+        (self.max_r / ASPECT * 0.6).max(2.5)
+    }
+
+    /// The lava-lamp cycle. A hot riser that reaches the cold top pool is
+    /// absorbed (goopy splash) and the top pool sheds a cold drip in its place;
+    /// a cold sinker that reaches the hot bottom pool is absorbed and the bottom
+    /// pool sheds a hot riser. Mass circulates and the count stays balanced, so
+    /// nothing accumulates in the middle.
+    fn pool_exchange(&mut self) {
+        let h = self.h as f32;
+        let tb = self.band();
+        let blobs = std::mem::take(&mut self.blobs);
+        let mut goo: Vec<(f32, f32, f32, f32)> = Vec::new();
+        let (mut emit_hot, mut emit_cold) = (0u32, 0u32);
+        for b in blobs {
+            if b.temp > 0.5 && b.y <= tb {
+                goo.push((b.x, b.y, COLD, b.r)); // fuses into the cold pool
+                emit_cold += 1;
+            } else if b.temp < 0.5 && b.y >= h - tb {
+                goo.push((b.x, b.y, HOT, b.r)); // fuses into the hot pool
+                emit_hot += 1;
+            } else {
+                self.blobs.push(b);
+            }
+        }
+        self.cycles += emit_hot + emit_cold;
+        for (x, y, t, r) in goo {
+            self.spawn_goo(x, y, t, r, 4, 2.6);
+        }
+        for _ in 0..emit_cold {
+            self.emit(false);
+        }
+        for _ in 0..emit_hot {
+            self.emit(true);
+        }
+    }
+
+    /// Birth a blob from a pool: a hot riser from the bottom, or a cold drip
+    /// from the top. It starts just inside the pool surface with a nudge in its
+    /// travel direction, plus a little goo to sell the pinch-off.
+    fn emit(&mut self, hot: bool) {
+        let tb = self.band();
+        let (w, h) = (self.w as f32, self.h as f32);
+        let m = self.max_r.min(w * 0.4);
+        let x = self.rng.range(m, (w - m).max(m + 0.1));
+        let r = self.rng.range(self.max_r * 0.55, self.max_r * 0.95);
+        let (y, vy, temp) = if hot {
+            (h - tb - 1.0, self.rng.range(-1.5, -0.5), HOT)
+        } else {
+            (tb + 1.0, self.rng.range(0.5, 1.5), COLD)
+        };
+        self.blobs.push(Blob {
+            x,
+            y,
+            vx: self.rng.range(-1.2, 1.2),
+            vy,
+            r,
+            temp,
+            phase: self.rng.range(0.0, 6.28),
+        });
+        self.spawn_goo(x, y, temp, r, 2, 1.6);
+    }
+
     /// Merge overlapping blobs, conserving area (and blending temperature by
     /// area) — the metaball neck between them has already been drawn goopy.
     fn merge_pass(&mut self) {
@@ -317,7 +369,12 @@ impl World {
                 let dy = (a.y - b.y) * ASPECT;
                 let dist = (dx * dx + dy * dy).sqrt();
                 let combined_r = (a.r * a.r + b.r * b.r).sqrt();
-                if dist < (a.r + b.r) * 0.5 && combined_r <= self.max_r * 1.02 {
+                // Only fuse like-temperature wax (both rising or both sinking).
+                // A hot and a cold blob must NOT average to neutral buoyancy —
+                // that's what stranded them in the middle. They pass through
+                // each other goopily via the field instead.
+                let alike = (a.temp - b.temp).abs() < 0.4;
+                if alike && dist < (a.r + b.r) * 0.45 && combined_r <= self.max_r * 1.02 {
                     let (aa, ba) = (a.r * a.r, b.r * b.r);
                     let sum = aa + ba;
                     let nb = Blob {
@@ -360,18 +417,6 @@ impl World {
         }
     }
 
-    fn split_largest(&mut self) {
-        if let Some((i, _)) = self
-            .blobs
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.r.partial_cmp(&b.1.r).unwrap())
-        {
-            let b = self.blobs[i].clone();
-            self.split_at(i, &b);
-        }
-    }
-
     fn split_at(&mut self, i: usize, b: &Blob) {
         let nr = (b.r / std::f32::consts::SQRT_2).max(MIN_RADIUS);
         let push = self.rng.range(1.5, 3.0);
@@ -400,8 +445,15 @@ impl World {
     }
 
     fn enforce_count(&mut self) {
-        while self.blobs.len() < self.target.saturating_sub(1).max(2) {
-            self.split_largest();
+        // Top up from the pools, alternating hot risers and cold drips.
+        let mut hot = self.blobs.len() % 2 == 0;
+        while self.blobs.len() < self.target {
+            self.emit(hot);
+            hot = !hot;
+        }
+        // Guard against runaway growth from splits.
+        while self.blobs.len() > self.target + 4 {
+            self.blobs.pop();
         }
     }
 
@@ -583,6 +635,34 @@ fn run_test() {
     }
     println!("== frame +4s ({} blobs) ==", world.blobs.len());
     print!("{}", render_plain(&world));
+
+    // Liveness check: over a long run, wax should keep circulating (many pool
+    // absorptions) and not pile up in the middle third of the lamp.
+    let c0 = world.cycles;
+    let (mut top, mut mid, mut bot) = (0u64, 0u64, 0u64);
+    let steps = 1800; // ~60s at 30fps
+    for _ in 0..steps {
+        world.update(0.033);
+        for b in &world.blobs {
+            let ny = b.y / world.h as f32;
+            if ny < 0.33 {
+                top += 1;
+            } else if ny > 0.66 {
+                bot += 1;
+            } else {
+                mid += 1;
+            }
+        }
+    }
+    let total = (top + mid + bot).max(1) as f32;
+    println!(
+        "== liveness over {}s: {} absorptions | occupancy top {:.0}% mid {:.0}% bot {:.0}% ==",
+        (steps as f32 * 0.033) as u32,
+        world.cycles - c0,
+        100.0 * top as f32 / total,
+        100.0 * mid as f32 / total,
+        100.0 * bot as f32 / total,
+    );
 
     // Sanity on a wide-short window: blobs must stay small.
     let mut wide = World::new(200, 12, 0x9);
