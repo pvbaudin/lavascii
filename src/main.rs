@@ -26,12 +26,15 @@ const ASPECT: f32 = 2.0;
 // ---- tunables -------------------------------------------------------------
 const ABS_MAX_RADIUS: f32 = 26.0; // hard upper size cap (column units)
 const MIN_RADIUS: f32 = 2.5; // never shrink a blob below this
-const BUOY: f32 = 15.0; // buoyancy acceleration scale
-const DAMP_V: f32 = 1.5; // vertical velocity damping (1/s)
-const DAMP_H: f32 = 1.4; // horizontal velocity damping (1/s)
-const WOBBLE: f32 = 6.0; // horizontal wander acceleration
+const BUOY: f32 = 9.0; // buoyancy acceleration scale
+const DAMP_V: f32 = 1.6; // vertical velocity damping (1/s)
+const DAMP_H: f32 = 1.5; // horizontal velocity damping (1/s)
+const WOBBLE: f32 = 3.5; // horizontal wander acceleration
 const HOT: f32 = 0.92; // temperature of a rising (hot) blob
 const COLD: f32 = 0.08; // temperature of a sinking (cold) blob
+const EASE: f32 = 2.5; // radius easing rate (1/s) — smooths merges/splits
+const COHESION: f32 = 6.0; // like-temp attraction that draws blobs together
+const VISC: f32 = 2.5; // relative-velocity damping between close blobs
 
 /// A tiny, dependency-free xorshift PRNG. Good enough for jitter and phases.
 struct Rng(u64);
@@ -64,7 +67,8 @@ struct Blob {
     y: f32,
     vx: f32,
     vy: f32,
-    r: f32,
+    r: f32,  // current (rendered) radius, eases toward rt
+    rt: f32, // target radius
     temp: f32, // 0 = cold, 1 = hot
     phase: f32, // personal wobble phase
 }
@@ -166,7 +170,7 @@ impl World {
                 temp: 1.0,
                 phase,
                 amp,
-                speed: self.rng.range(0.7, 1.3),
+                speed: self.rng.range(0.4, 0.8),
             });
             let phase2 = self.rng.range(0.0, 6.28);
             // top = cold
@@ -177,7 +181,7 @@ impl World {
                 temp: 0.0,
                 phase: phase2,
                 amp,
-                speed: self.rng.range(0.7, 1.3),
+                speed: self.rng.range(0.4, 0.8),
             });
         }
     }
@@ -198,6 +202,7 @@ impl World {
                 vx: self.rng.range(-1.5, 1.5),
                 vy: if hot { -1.0 } else { 1.0 },
                 r,
+                rt: r,
                 temp: if hot { HOT } else { COLD },
                 phase: self.rng.range(0.0, 6.28),
             });
@@ -225,7 +230,14 @@ impl World {
         self.t += dt;
         let (w, h) = (self.w as f32, self.h as f32);
 
+        // Like-temperature blobs gently draw together and share momentum, so
+        // they slide into a merge instead of snapping across a gap.
+        self.cohesion(dt);
+
         for b in &mut self.blobs {
+            // Radius glides toward its target so merges grow and splits shrink
+            // smoothly rather than popping.
+            b.r += (b.rt - b.r) * (EASE * dt).min(1.0);
             // Temperature is fixed while a blob is in flight — it's set when the
             // blob is born from a pool and only ever HOT or COLD. So a blob is
             // always decisively buoyant or heavy and can never equilibrate to a
@@ -290,6 +302,47 @@ impl World {
         }
     }
 
+    /// Gentle cohesion between like-temperature blobs that are close enough to
+    /// eventually merge: a soft mutual attraction plus relative-velocity
+    /// damping (viscosity). This makes them ooze together and settle nearly
+    /// concentric before the discrete merge fires, so the merge barely moves
+    /// the centre. Opposite-temperature blobs are ignored (they must not clump)
+    /// and pairs too big to merge are skipped (so they don't rattle at the cap).
+    fn cohesion(&mut self, dt: f32) {
+        let n = self.blobs.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (a, b) = (self.blobs[i].clone(), self.blobs[j].clone());
+                if (a.temp - b.temp).abs() >= 0.4 {
+                    continue;
+                }
+                if (a.r * a.r + b.r * b.r).sqrt() > self.max_r * 1.02 {
+                    continue;
+                }
+                let (dsx, dsy) = (b.x - a.x, b.y - a.y);
+                let dscreen = (dsx * dsx + dsy * dsy).sqrt().max(0.001);
+                let dcorr = (dsx * dsx + dsy * dsy * ASPECT * ASPECT).sqrt();
+                let reach = (a.r + b.r) * 1.15;
+                if dcorr > reach {
+                    continue;
+                }
+                let k = 1.0 - dcorr / reach; // 0 at the edge, 1 when concentric
+                let (ux, uy) = (dsx / dscreen, dsy / dscreen);
+                let acc = COHESION * k * dt;
+                self.blobs[i].vx += ux * acc;
+                self.blobs[i].vy += uy * acc;
+                self.blobs[j].vx -= ux * acc;
+                self.blobs[j].vy -= uy * acc;
+                let vk = VISC * k * dt * 0.5;
+                let (rvx, rvy) = (b.vx - a.vx, b.vy - a.vy);
+                self.blobs[i].vx += rvx * vk;
+                self.blobs[i].vy += rvy * vk;
+                self.blobs[j].vx -= rvx * vk;
+                self.blobs[j].vy -= rvy * vk;
+            }
+        }
+    }
+
     /// Vertical reach of a pool's wobbling surface, in rows. Absorption happens
     /// once a blob has sunk this far into the top or bottom band.
     fn band(&self) -> f32 {
@@ -349,7 +402,8 @@ impl World {
             y,
             vx: self.rng.range(-1.2, 1.2),
             vy,
-            r,
+            r: MIN_RADIUS, // grows out of the pool
+            rt: r,
             temp,
             phase: self.rng.range(0.0, 6.28),
         });
@@ -382,7 +436,8 @@ impl World {
                         y: (a.y * aa + b.y * ba) / sum,
                         vx: (a.vx * aa + b.vx * ba) / sum,
                         vy: (a.vy * aa + b.vy * ba) / sum,
-                        r: combined_r,
+                        r: a.r.max(b.r), // start at the larger, grow into...
+                        rt: combined_r,  // ...the combined size
                         temp: (a.temp * aa + b.temp * ba) / sum,
                         phase: a.phase,
                     };
@@ -427,7 +482,8 @@ impl World {
             y: b.y - oy,
             vx: b.vx - push,
             vy: b.vy - oy.signum() * 0.5,
-            r: nr,
+            r: b.r * 0.85, // start near the parent size, shrink into halves
+            rt: nr,
             temp: b.temp,
             phase: self.rng.range(0.0, 6.28),
         };
@@ -436,7 +492,8 @@ impl World {
             y: b.y + oy,
             vx: b.vx + push,
             vy: b.vy + oy.signum() * 0.5,
-            r: nr,
+            r: b.r * 0.85,
+            rt: nr,
             temp: b.temp,
             phase: self.rng.range(0.0, 6.28),
         });
