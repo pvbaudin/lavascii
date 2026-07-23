@@ -216,7 +216,7 @@ fn ramp_by_name(s: &str) -> Option<&'static [char]> {
 }
 
 /// Runtime configuration assembled from CLI arguments.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Config {
     speed: f32,      // simulation time multiplier
     scheme: Scheme,  // colour palette
@@ -227,6 +227,7 @@ struct Config {
     color: bool,     // truecolor vs. plain glyphs
     paused: bool,    // interactive pause
     seed: u64,       // PRNG seed
+    text: Option<String>, // if set, the wax reveals these words instead of glyphs
 }
 
 impl Default for Config {
@@ -241,6 +242,7 @@ impl Default for Config {
             color: true,
             paused: false,
             seed: 0x1234_5678,
+            text: None,
         }
     }
 }
@@ -258,6 +260,7 @@ OPTIONS:
     -z, --size <F>        Blob-size multiplier (0.3–2)            [default: 1.0]
     -f, --fps <N>         Target frame rate (5–120)               [default: 30]
     -r, --ramp <NAME>     Glyph ramp: ascii, blocks, dots, shade  [default: ascii]
+    -t, --text <FILE>     Reveal words from a text file in the wax
         --mono            Monochrome (no color, just glyphs)
         --seed <N>        Fixed PRNG seed (reproducible)
     -h, --help            Print this help
@@ -275,6 +278,7 @@ EXAMPLES:
     lavalamp --scheme ocean --speed 0.6
     lavalamp -c ember -d 1.5 -f 60
     lavalamp --scheme rainbow --ramp blocks
+    lavalamp --text poem.txt --scheme ember
 ";
 
 /// Fetch an option's value, supporting both `--key val` and `--key=val`.
@@ -348,6 +352,15 @@ fn parse_args() -> Result<Option<Config>, String> {
                 let v = take_val(&args, &mut i, &inline, "--ramp")?;
                 cfg.ramp = ramp_by_name(&v)
                     .ok_or_else(|| format!("unknown ramp '{v}' (ascii|blocks|dots|shade)"))?;
+            }
+            "-t" | "--text" => {
+                let path = take_val(&args, &mut i, &inline, "--text")?;
+                let body = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("cannot read text file '{path}': {e}"))?;
+                if body.split_whitespace().next().is_none() {
+                    return Err(format!("text file '{path}' has no words"));
+                }
+                cfg.text = Some(body);
             }
             "--mono" => cfg.color = false,
             "--seed" => {
@@ -433,6 +446,7 @@ struct World {
     rng: Rng,
     t: f32,
     cfg: Config,
+    text_grid: Vec<char>, // per-cell words to reveal (empty = use the glyph ramp)
     cycles: u32, // total pool absorptions — a liveness counter for --test
     merges: u32, // diagnostics
     splits: u32,
@@ -450,6 +464,7 @@ impl World {
             rng: Rng::new(cfg.seed),
             t: 0.0,
             cfg,
+            text_grid: Vec::new(),
             cycles: 0,
             merges: 0,
             splits: 0,
@@ -471,6 +486,46 @@ impl World {
         let base = (area / 520.0) * self.cfg.density / (size * size);
         self.target = (base as usize).clamp(2, 40);
         self.rebuild_pools();
+        self.build_text_grid();
+    }
+
+    /// Lay the configured text across the grid, reflowed to the current width,
+    /// so words stay in fixed positions and the wax reveals them as it flows
+    /// over them. Words wrap to the next row and the text repeats to fill the
+    /// screen. Cells with no letter are left blank (they fall back to the glyph
+    /// ramp inside a blob, or stay background outside one).
+    fn build_text_grid(&mut self) {
+        self.text_grid.clear();
+        let words: Vec<Vec<char>> = match &self.cfg.text {
+            Some(t) => t.split_whitespace().map(|w| w.chars().collect()).collect(),
+            None => return,
+        };
+        if words.is_empty() {
+            return;
+        }
+        let (w, h) = (self.w, self.h);
+        let mut grid = vec![' '; w * h];
+        let mut wi = 0usize;
+        for row in 0..h {
+            let mut col = 0usize;
+            while col < w {
+                let word = &words[wi % words.len()];
+                let wl = word.len();
+                // Wrap a word that won't fit on the rest of this row (unless the
+                // row is empty and the word is simply too long — then truncate).
+                if col > 0 && col + wl > w && wl <= w {
+                    break;
+                }
+                for (k, &ch) in word.iter().enumerate() {
+                    if col + k < w {
+                        grid[row * w + col + k] = ch;
+                    }
+                }
+                wi += 1;
+                col += wl + 1; // trailing space between words
+            }
+        }
+        self.text_grid = grid;
     }
 
     fn rebuild_pools(&mut self) {
@@ -862,6 +917,18 @@ fn ramp_char(ramp: &[char], i: f32) -> char {
     ramp[idx.min(ramp.len() - 1)]
 }
 
+/// The glyph for a filled cell: a letter from the revealed text if one sits
+/// here, otherwise the density-ramp glyph. Word gaps inside a blob fall back to
+/// the ramp so the wax body stays solid.
+fn cell_glyph(world: &World, idx: usize, dens: f32) -> char {
+    if let Some(&c) = world.text_grid.get(idx) {
+        if c != ' ' {
+            return c;
+        }
+    }
+    ramp_char(world.cfg.ramp, dens)
+}
+
 /// Render the world into an ANSI frame (cursor is homed by caller), honouring
 /// the configured colour scheme, glyph ramp and mono flag.
 fn render_ansi(world: &World, buf: &mut String) {
@@ -880,7 +947,7 @@ fn render_ansi(world: &World, buf: &mut String) {
                 continue;
             }
             let dens = intensity(field);
-            let ch = ramp_char(cfg.ramp, dens);
+            let ch = cell_glyph(world, row * world.w + col, dens);
             if cfg.color {
                 // Density drives the glyph; colour follows density but drifts a
                 // little with temperature to keep the wax alive within one hue.
@@ -916,7 +983,7 @@ fn glyph_grid(world: &World) -> Vec<char> {
             g.push(if field < FIELD_LO {
                 ' '
             } else {
-                ramp_char(world.cfg.ramp, intensity(field))
+                cell_glyph(world, row * world.w + col, intensity(field))
             });
         }
     }
@@ -1014,7 +1081,10 @@ fn seed() -> u64 {
 
 fn run_test() {
     let (w, h) = (80usize, 40usize);
-    let mut world = World::new(w, h, Config { seed: 0x1234_5678, ..Config::default() });
+    // Honour CLI options (scheme/text/etc.) so --test doubles as a headless
+    // preview, but pin the seed for deterministic diagnostics.
+    let cfg = parse_args().ok().flatten().unwrap_or_default();
+    let mut world = World::new(w, h, Config { seed: 0x1234_5678, ..cfg });
     // Warm up so blobs are mid-cycle.
     for _ in 0..400 {
         world.update(0.033);
