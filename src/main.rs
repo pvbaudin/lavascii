@@ -71,6 +71,7 @@ struct Blob {
     rt: f32, // target radius
     temp: f32, // 0 = cold, 1 = hot
     phase: f32, // personal wobble phase
+    dying: bool, // being absorbed into a pool: melt to nothing, then remove
 }
 
 /// A slab of the top or bottom pool — a big metaball whose surface bobs.
@@ -118,6 +119,8 @@ struct World {
     rng: Rng,
     t: f32,
     cycles: u32, // total pool absorptions — a liveness counter for --test
+    merges: u32, // diagnostics
+    splits: u32,
 }
 
 impl World {
@@ -133,6 +136,8 @@ impl World {
             rng: Rng::new(seed),
             t: 0.0,
             cycles: 0,
+            merges: 0,
+            splits: 0,
         };
         world.recompute_layout();
         world.spawn_initial();
@@ -205,6 +210,7 @@ impl World {
                 rt: r,
                 temp: if hot { HOT } else { COLD },
                 phase: self.rng.range(0.0, 6.28),
+                dying: false,
             });
         }
     }
@@ -235,9 +241,13 @@ impl World {
         self.cohesion(dt);
 
         for b in &mut self.blobs {
-            // Radius glides toward its target so merges grow and splits shrink
-            // smoothly rather than popping.
+            // Radius glides toward its target so merges grow, splits shrink,
+            // and absorbed blobs melt away smoothly rather than popping.
             b.r += (b.rt - b.r) * (EASE * dt).min(1.0);
+            // A dying blob is dissolving into a pool: no forces, just melt.
+            if b.dying {
+                continue;
+            }
             // Temperature is fixed while a blob is in flight — it's set when the
             // blob is born from a pool and only ever HOT or COLD. So a blob is
             // always decisively buoyant or heavy and can never equilibrate to a
@@ -265,6 +275,8 @@ impl World {
             // them (below), so there's no hard vertical wall to bounce off.
             b.y = b.y.clamp(0.5, h - 0.5);
         }
+        // Reap fully-melted blobs.
+        self.blobs.retain(|b| !(b.dying && b.r < 0.5));
 
         self.pool_exchange();
 
@@ -281,7 +293,6 @@ impl World {
         self.droplets.retain(|d| d.age < d.ttl);
 
         self.merge_pass();
-        self.split_pass();
         self.enforce_count();
     }
 
@@ -313,6 +324,9 @@ impl World {
         for i in 0..n {
             for j in (i + 1)..n {
                 let (a, b) = (self.blobs[i].clone(), self.blobs[j].clone());
+                if a.dying || b.dying {
+                    continue;
+                }
                 if (a.temp - b.temp).abs() >= 0.4 {
                     continue;
                 }
@@ -357,24 +371,24 @@ impl World {
     fn pool_exchange(&mut self) {
         let h = self.h as f32;
         let tb = self.band();
-        let blobs = std::mem::take(&mut self.blobs);
-        let mut goo: Vec<(f32, f32, f32, f32)> = Vec::new();
         let (mut emit_hot, mut emit_cold) = (0u32, 0u32);
-        for b in blobs {
+        for b in &mut self.blobs {
+            if b.dying {
+                continue; // already melting into a pool
+            }
+            // A blob that has reached the far pool starts dissolving into it
+            // (melt its radius to 0) and the opposite pool sheds a replacement.
             if b.temp > 0.5 && b.y <= tb {
-                goo.push((b.x, b.y, COLD, b.r)); // fuses into the cold pool
+                b.dying = true;
+                b.rt = 0.0;
                 emit_cold += 1;
             } else if b.temp < 0.5 && b.y >= h - tb {
-                goo.push((b.x, b.y, HOT, b.r)); // fuses into the hot pool
+                b.dying = true;
+                b.rt = 0.0;
                 emit_hot += 1;
-            } else {
-                self.blobs.push(b);
             }
         }
         self.cycles += emit_hot + emit_cold;
-        for (x, y, t, r) in goo {
-            self.spawn_goo(x, y, t, r, 4, 2.6);
-        }
         for _ in 0..emit_cold {
             self.emit(false);
         }
@@ -406,8 +420,9 @@ impl World {
             rt: r,
             temp,
             phase: self.rng.range(0.0, 6.28),
+            dying: false,
         });
-        self.spawn_goo(x, y, temp, r, 2, 1.6);
+        self.spawn_goo(x, y, temp, r, 2, 1.4);
     }
 
     /// Merge overlapping blobs, conserving area (and blending temperature by
@@ -427,7 +442,7 @@ impl World {
                 // A hot and a cold blob must NOT average to neutral buoyancy —
                 // that's what stranded them in the middle. They pass through
                 // each other goopily via the field instead.
-                let alike = (a.temp - b.temp).abs() < 0.4;
+                let alike = (a.temp - b.temp).abs() < 0.4 && !a.dying && !b.dying;
                 if alike && dist < (a.r + b.r) * 0.45 && combined_r <= self.max_r * 1.02 {
                     let (aa, ba) = (a.r * a.r, b.r * b.r);
                     let sum = aa + ba;
@@ -440,12 +455,14 @@ impl World {
                         rt: combined_r,  // ...the combined size
                         temp: (a.temp * aa + b.temp * ba) / sum,
                         phase: a.phase,
+                        dying: false,
                     };
                     // A little splash of goo squeezed out at the contact point.
                     let (cx, cy, ct, cr) = (nb.x, nb.y, nb.temp, nb.r);
                     self.blobs[i] = nb;
                     self.blobs.swap_remove(j);
-                    self.spawn_goo(cx, cy, ct, cr, 3, 3.0);
+                    self.spawn_goo(cx, cy, ct, cr, 2, 2.0);
+                    self.merges += 1;
                     merged = true;
                 } else {
                     j += 1;
@@ -455,50 +472,6 @@ impl World {
                 i += 1;
             }
         }
-    }
-
-    /// Occasionally a fat blob pinches into two, pushed gently apart. They
-    /// start close so the metaball bridge thins out for a goopy split.
-    fn split_pass(&mut self) {
-        if self.blobs.len() >= self.target + 3 {
-            return;
-        }
-        let n = self.blobs.len();
-        for i in 0..n {
-            let b = self.blobs[i].clone();
-            if b.r > self.max_r * 0.82 && self.rng.f32() < 0.010 {
-                self.split_at(i, &b);
-            }
-        }
-    }
-
-    fn split_at(&mut self, i: usize, b: &Blob) {
-        let nr = (b.r / std::f32::consts::SQRT_2).max(MIN_RADIUS);
-        let push = self.rng.range(1.5, 3.0);
-        let ang = self.rng.range(0.0, 6.28);
-        let (ox, oy) = (ang.cos() * nr * 0.5, ang.sin() * nr * 0.5 / ASPECT);
-        self.blobs[i] = Blob {
-            x: b.x - ox,
-            y: b.y - oy,
-            vx: b.vx - push,
-            vy: b.vy - oy.signum() * 0.5,
-            r: b.r * 0.85, // start near the parent size, shrink into halves
-            rt: nr,
-            temp: b.temp,
-            phase: self.rng.range(0.0, 6.28),
-        };
-        self.blobs.push(Blob {
-            x: b.x + ox,
-            y: b.y + oy,
-            vx: b.vx + push,
-            vy: b.vy + oy.signum() * 0.5,
-            r: b.r * 0.85,
-            rt: nr,
-            temp: b.temp,
-            phase: self.rng.range(0.0, 6.28),
-        });
-        // Stringy filament left behind between the two halves.
-        self.spawn_goo(b.x, b.y, b.temp, b.r, 2, 1.4);
     }
 
     fn enforce_count(&mut self) {
@@ -664,6 +637,104 @@ fn render_plain(world: &World) -> String {
     s
 }
 
+/// Flat row-major glyph grid, for frame-to-frame churn diagnostics.
+fn glyph_grid(world: &World) -> Vec<char> {
+    let mut g = Vec::with_capacity(world.w * world.h);
+    for row in 0..world.h {
+        for col in 0..world.w {
+            let (field, _t) = world.sample(col as f32 + 0.5, row as f32 + 0.5);
+            g.push(if field < FIELD_LO {
+                ' '
+            } else {
+                ramp_char(intensity(field))
+            });
+        }
+    }
+    g
+}
+
+fn grid_str(g: &[char], w: usize, h: usize) -> String {
+    let mut s = String::with_capacity(g.len() + h);
+    for row in 0..h {
+        s.extend(&g[row * w..(row + 1) * w]);
+        s.push('\n');
+    }
+    s
+}
+
+/// Simulate headlessly and report how "spastic" the motion is: per-frame churn
+/// (cells changing glyph), correlated with merge/split/absorb events, plus a
+/// dump of the frames around the worst spike so the culprit is visible.
+fn run_diag() {
+    let (w, h) = (80usize, 40usize);
+    let mut world = World::new(w, h, 0x1234_5678);
+    for _ in 0..150 {
+        world.update(1.0 / 30.0);
+    }
+    let n = 300usize;
+    let total = (w * h) as f32;
+    let mut frames: Vec<Vec<char>> = Vec::with_capacity(n);
+    let mut churn = vec![0usize; n];
+    let mut ev = vec![(0u32, 0u32, 0u32, 0usize); n];
+    let (mut pm, mut ps, mut pc) = (world.merges, world.splits, world.cycles);
+    let mut prev = glyph_grid(&world);
+    for f in 0..n {
+        world.update(1.0 / 30.0);
+        let g = glyph_grid(&world);
+        churn[f] = (0..g.len()).filter(|&k| g[k] != prev[k]).count();
+        ev[f] = (
+            world.merges - pm,
+            world.splits - ps,
+            world.cycles - pc,
+            world.blobs.len(),
+        );
+        pm = world.merges;
+        ps = world.splits;
+        pc = world.cycles;
+        prev = g.clone();
+        frames.push(g);
+    }
+    let mean = churn.iter().sum::<usize>() as f32 / n as f32;
+    let (peak_f, &peak_c) = churn.iter().enumerate().max_by_key(|(_, &c)| c).unwrap();
+    println!("== diag {}x{}, {} frames @30fps ==", w, h, n);
+    println!(
+        "totals: merges {} splits {} absorptions {}",
+        world.merges, world.splits, world.cycles
+    );
+    println!(
+        "churn: mean {:.0} cells/frame ({:.1}%), peak {} ({:.1}%) at frame {}",
+        mean,
+        100.0 * mean / total,
+        peak_c,
+        100.0 * peak_c as f32 / total,
+        peak_f
+    );
+    // Timeline: flag frames that spike or carry an event.
+    println!("-- notable frames (spike >2.5x mean, or merge/split/absorb) --");
+    for f in 0..n {
+        let (m, s, c, cnt) = ev[f];
+        let spike = churn[f] as f32 > 2.5 * mean;
+        if spike || m > 0 || s > 0 || c > 0 {
+            println!(
+                "  f{:>3} churn {:>4} ({:>2.0}%) {}{}{} blobs={}",
+                f,
+                churn[f],
+                100.0 * churn[f] as f32 / total,
+                if m > 0 { format!("MERGE×{m} ") } else { String::new() },
+                if s > 0 { format!("SPLIT×{s} ") } else { String::new() },
+                if c > 0 { format!("ABSORB×{c} ") } else { String::new() },
+                cnt,
+            );
+        }
+    }
+    // Show the frames straddling the worst spike.
+    println!("-- frames around peak churn (f{}) --", peak_f);
+    for f in peak_f.saturating_sub(1)..=(peak_f + 1).min(n - 1) {
+        println!("--- frame {} (churn {}) ---", f, churn[f]);
+        print!("{}", grid_str(&frames[f], w, h));
+    }
+}
+
 fn seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -797,6 +868,10 @@ fn run_interactive() -> io::Result<()> {
 fn main() {
     if std::env::args().any(|a| a == "--test") {
         run_test();
+        return;
+    }
+    if std::env::args().any(|a| a == "--diag") {
+        run_diag();
         return;
     }
     if let Err(e) = run_interactive() {
