@@ -1079,6 +1079,70 @@ fn seed() -> u64 {
         .unwrap_or(0x9e3779b97f4a7c15)
 }
 
+/// Micro-benchmark the two hot paths (physics `update` + `render_ansi`) at a
+/// range of terminal sizes, so we can see the CPU cost per frame and how it
+/// scales. Prints implied CPU load at 30 and 60 fps.
+fn run_bench() {
+    // (cols, rows) — from a small pane up to a very large full-screen terminal.
+    let sizes = [(80, 24), (120, 40), (200, 50), (300, 80), (400, 100)];
+    println!(
+        "{:>9} {:>6} {:>6} {:>9} {:>8} {:>9} {:>9} {:>8} {:>7} {:>7}",
+        "size", "cells", "bodies", "update_ms", "mono_ms", "render_ms", "total_ms", "max_fps", "@30fps", "@60fps"
+    );
+    for (w, h) in sizes {
+        let mut world = World::new(w, h, Config { seed: 0x1234_5678, ..Config::default() });
+        for _ in 0..90 {
+            world.update(1.0 / 30.0);
+        }
+        let bodies = world.blobs.len() + world.pools.len();
+        let iters = 200;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            world.update(1.0 / 30.0);
+        }
+        let update_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let mut buf = String::with_capacity(w * h * 8);
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            render_ansi(&world, &mut buf);
+        }
+        let render_ms = t1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // Time again with colour off to attribute cost: mono skips the per-cell
+        // colour escape, so (render - mono) is the colour-formatting overhead
+        // and mono is the field-sampling floor.
+        world.cfg.color = false;
+        let t2 = Instant::now();
+        for _ in 0..iters {
+            render_ansi(&world, &mut buf);
+        }
+        let mono_ms = t2.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        world.cfg.color = true;
+
+        let total = update_ms + render_ms;
+        let max_fps = if total > 0.0 { 1000.0 / total } else { 0.0 };
+        println!(
+            "{:>9} {:>6} {:>6} {:>9.3} {:>8.3} {:>9.3} {:>9.3} {:>8.0} {:>6.1}% {:>6.1}%",
+            format!("{w}x{h}"),
+            w * h,
+            bodies,
+            update_ms,
+            mono_ms,
+            render_ms,
+            total,
+            max_fps,
+            total / (1000.0 / 30.0) * 100.0,
+            total / (1000.0 / 60.0) * 100.0,
+        );
+    }
+    println!(
+        "\nCPU% is the fraction of one core used by the render loop at that fps\n\
+         (the loop sleeps the rest of each frame). Frame buffer memory is ~w*h bytes."
+    );
+}
+
 fn run_test() {
     let (w, h) = (80usize, 40usize);
     // Honour CLI options (scheme/text/etc.) so --test doubles as a headless
@@ -1252,6 +1316,10 @@ fn main() {
     }
     if raw.iter().any(|a| a == "--diag") {
         run_diag();
+        return;
+    }
+    if raw.iter().any(|a| a == "--bench") {
+        run_bench();
         return;
     }
     match parse_args() {
