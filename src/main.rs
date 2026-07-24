@@ -263,14 +263,18 @@ impl TextBuffer {
 fn spawn_stdin_reader(buf: Arc<Mutex<TextBuffer>>, reader: Box<dyn io::Read + Send>) {
     std::thread::spawn(move || {
         let mut r = io::BufReader::new(reader);
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
         loop {
             line.clear();
-            match r.read_line(&mut line) {
+            // Read raw bytes, not a UTF-8 String: a single non-UTF-8 byte (a
+            // Latin-1 quote/dash, a subtitle-encoding artifact, …) must not
+            // abort the whole feed. Decode lossily, like the file path does.
+            match r.read_until(b'\n', &mut line) {
                 Ok(0) | Err(_) => break, // EOF or error: stop, keep what we have
                 Ok(_) => {
+                    let text = String::from_utf8_lossy(&line);
                     if let Ok(mut b) = buf.lock() {
-                        for w in line.split_whitespace() {
+                        for w in text.split_whitespace() {
                             b.push(w);
                         }
                     }
