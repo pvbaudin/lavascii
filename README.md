@@ -50,17 +50,22 @@ combination without a live terminal by adding `--test`, e.g.
 `lavalamp --test --text paper.pdf`.
 
 You can also feed text **live from stdin** — just pipe into `lavalamp` (or pass
-`--text -`). Incoming words flow into a bounded ring buffer (the most recent
-~8 KB), so an endless feed stays light and always shows the latest text:
+`--text -`). Incoming lines flow into a bounded ring buffer (the most recent
+~8 KB) and the view stays anchored to the newest lines, scrolling up like a log
+tail, so an endless feed stays light and smooth:
 
 ```sh
 echo "hello lava world" | lavalamp
 tail -f /var/log/system.log | lavalamp -c green   # watch logs goop by
+vtt-stdout | lavalamp -c ember                    # live speech-to-text
 fortune | lavalamp --scheme sunset
 ```
 
-Keyboard controls still work while piping (they're read from the terminal, not
-stdin).
+Live inputs are cleaned before display: ANSI escape sequences and control
+characters are stripped, and lines rewritten in place with carriage returns
+(voice-to-text refining its guess, progress meters) collapse to their final
+revision — so nothing corrupts the terminal or shows as gibberish. Keyboard
+controls still work while piping (they're read from the terminal, not stdin).
 
 Resize the window any time — the scene reflows and rescales live.
 

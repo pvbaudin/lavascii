@@ -217,13 +217,15 @@ fn ramp_by_name(s: &str) -> Option<&'static [char]> {
     }
 }
 
-/// A bounded ring of the most-recently-seen words, fed live from stdin. Old
-/// words are dropped once the total length exceeds `TEXT_CAP`, so a long or
-/// endless stream (`tail -f …`) stays bounded. `version` bumps on every change
-/// so the renderer knows when to rebuild.
+/// A bounded ring of the most-recently-seen *lines*, fed live from stdin. Old
+/// lines are dropped once the total length exceeds `TEXT_CAP`, so a long or
+/// endless stream (`tail -f …`) stays bounded. Storing whole finalized lines
+/// (rather than loose words) keeps the layout stable — appending a line never
+/// re-wraps the earlier ones — so a live feed scrolls smoothly instead of
+/// reflowing on every word. `version` bumps on every change.
 const TEXT_CAP: usize = 8192; // ~chars retained
 struct TextBuffer {
-    words: std::collections::VecDeque<String>,
+    lines: std::collections::VecDeque<String>,
     total: usize,
     version: u64,
 }
@@ -231,16 +233,19 @@ struct TextBuffer {
 impl TextBuffer {
     fn new() -> Self {
         TextBuffer {
-            words: std::collections::VecDeque::new(),
+            lines: std::collections::VecDeque::new(),
             total: 0,
             version: 0,
         }
     }
-    fn push(&mut self, word: &str) {
-        self.words.push_back(word.to_string());
-        self.total += word.len() + 1;
-        while self.total > TEXT_CAP && self.words.len() > 1 {
-            if let Some(old) = self.words.pop_front() {
+    fn push_line(&mut self, line: String) {
+        if line.is_empty() {
+            return;
+        }
+        self.total += line.len() + 1;
+        self.lines.push_back(line);
+        while self.total > TEXT_CAP && self.lines.len() > 1 {
+            if let Some(old) = self.lines.pop_front() {
                 self.total -= old.len() + 1;
             }
         }
@@ -248,11 +253,11 @@ impl TextBuffer {
     }
     fn snapshot(&self) -> String {
         let mut s = String::with_capacity(self.total);
-        for (i, w) in self.words.iter().enumerate() {
+        for (i, l) in self.lines.iter().enumerate() {
             if i > 0 {
-                s.push(' ');
+                s.push('\n');
             }
-            s.push_str(w);
+            s.push_str(l);
         }
         s
     }
@@ -260,23 +265,29 @@ impl TextBuffer {
 
 /// Spawn a thread that reads `reader` line-by-line into the shared ring buffer.
 /// Works for both a one-shot pipe (`echo … | lavalamp`, read to EOF) and a live
-/// feed (`tail -f log | lavalamp`).
+/// feed (`tail -f log | lavalamp`, or a voice-to-text stream).
 fn spawn_stdin_reader(buf: Arc<Mutex<TextBuffer>>, reader: Box<dyn io::Read + Send>) {
     std::thread::spawn(move || {
         let mut r = io::BufReader::new(reader);
-        let mut line: Vec<u8> = Vec::new();
+        let mut raw: Vec<u8> = Vec::new();
         loop {
-            line.clear();
+            raw.clear();
             // Read raw bytes, not a UTF-8 String: a single non-UTF-8 byte (a
             // Latin-1 quote/dash, a subtitle-encoding artifact, …) must not
             // abort the whole feed. Decode lossily, like the file path does.
-            match r.read_until(b'\n', &mut line) {
+            match r.read_until(b'\n', &mut raw) {
                 Ok(0) | Err(_) => break, // EOF or error: stop, keep what we have
                 Ok(_) => {
-                    let text = String::from_utf8_lossy(&line);
-                    if let Ok(mut b) = buf.lock() {
-                        for w in text.split_whitespace() {
-                            b.push(w);
+                    let text = String::from_utf8_lossy(&raw);
+                    // A live line is often rewritten in place with carriage
+                    // returns (voice-to-text refining its guess, progress
+                    // meters). Keep only the final revision — the text after the
+                    // last '\r' — then strip any escapes/controls.
+                    let final_rev = text.rsplit('\r').next().unwrap_or(&text);
+                    let line = sanitize_line(final_rev);
+                    if !line.trim().is_empty() {
+                        if let Ok(mut b) = buf.lock() {
+                            b.push_line(line);
                         }
                     }
                 }
@@ -763,8 +774,16 @@ impl World {
             return;
         }
         self.text_canvas = canvas;
-        if self.scroll >= self.text_canvas.len() as f32 {
-            self.scroll = 0.0;
+        let n = self.text_canvas.len();
+        if self.auto_scroll {
+            // File mode scrolls/loops; just keep the offset in range.
+            if self.scroll >= n as f32 {
+                self.scroll = 0.0;
+            }
+        } else {
+            // Live stream: anchor to the bottom so the newest lines stay in
+            // view and older ones scroll up off the top (like a log tail).
+            self.scroll = n.saturating_sub(self.h) as f32;
         }
     }
 
@@ -1184,11 +1203,22 @@ fn ramp_char(ramp: &[char], i: f32) -> char {
 fn cell_glyph(world: &World, col: usize, row: usize, dens: f32) -> char {
     let n = world.text_canvas.len();
     if n > 0 {
-        let cr = (world.scroll as usize + row) % n;
-        if let Some(&c) = world.text_canvas[cr].get(col) {
-            // Never emit a space (gap) or a control char into the frame.
-            if c != ' ' && !c.is_control() {
-                return c;
+        let base = world.scroll as usize + row;
+        // File mode wraps (loops the file); a live stream doesn't repeat — rows
+        // past the end are blank so short feeds don't tile across the screen.
+        let cr = if world.auto_scroll {
+            Some(base % n)
+        } else if base < n {
+            Some(base)
+        } else {
+            None
+        };
+        if let Some(cr) = cr {
+            if let Some(&c) = world.text_canvas[cr].get(col) {
+                // Never emit a space (gap) or a control char into the frame.
+                if c != ' ' && !c.is_control() {
+                    return c;
+                }
             }
         }
     }
