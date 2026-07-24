@@ -38,10 +38,14 @@ lavalamp --text poem.txt -c ember         # wax reveals your words
 
 With `--text`, the file's words are laid across the screen and the flowing wax
 reveals them where it covers them (colored by density); word gaps inside a blob
-fall back to the glyph ramp so the wax still looks solid. The file can be a
-plain-text file (any encoding — non-UTF-8 is read lossily) or a **PDF** (text is
-extracted automatically; scanned/image-only PDFs have no selectable text).
-Preview any combination without a live terminal by adding `--test`, e.g.
+fall back to the glyph ramp so the wax still looks solid. The file is wrapped
+into a tall canvas and the visible window **scrolls slowly downward** through it
+(about one line every 1.5s), with occasional jumps to a random passage — so the
+lamp keeps drifting through the whole file, staying dynamic but readable rather
+than frozen on the opening lines. The file can be a plain-text file (any
+encoding — non-UTF-8 is read lossily) or a **PDF** (text is extracted
+automatically; scanned/image-only PDFs have no selectable text). Preview any
+combination without a live terminal by adding `--test`, e.g.
 `lavalamp --test --text paper.pdf`.
 
 You can also feed text **live from stdin** — just pipe into `lavalamp` (or pass

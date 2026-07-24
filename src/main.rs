@@ -37,6 +37,7 @@ const EASE: f32 = 1.6; // radius easing rate (1/s) — smooths merges/melts/birt
 const COHESION: f32 = 6.0; // like-temp attraction that draws blobs together
 const VISC: f32 = 2.5; // relative-velocity damping between close blobs
 const MELT_PULL: f32 = 3.0; // how fast a dying blob flows toward its sink point
+const SCROLL_ROWS_PER_SEC: f32 = 0.7; // text scroll speed in file mode (rows/s)
 
 // ---- configuration (CLI) --------------------------------------------------
 
@@ -601,8 +602,14 @@ struct World {
     rng: Rng,
     t: f32,
     cfg: Config,
-    text_grid: Vec<char>, // per-cell words to reveal (empty = use the glyph ramp)
-    text_version: u64,    // version of the streamed text last built into the grid
+    // Revealed text is laid out as a tall canvas of wrapped rows; the visible
+    // window scrolls slowly down through it (with occasional random jumps) so
+    // file mode flows dynamically instead of showing a static beginning.
+    text_canvas: Vec<Vec<char>>, // wrapped rows of the source (empty = glyph ramp)
+    text_version: u64,           // version of the streamed text last laid out
+    auto_scroll: bool,           // scroll through the canvas (file mode)
+    scroll: f32,                 // current top row into the canvas
+    jump_in: f32,                // seconds until the next random jump
     cycles: u32, // total pool absorptions — a liveness counter for --test
     merges: u32, // diagnostics
     splits: u32,
@@ -619,9 +626,13 @@ impl World {
             pools: Vec::new(),
             rng: Rng::new(cfg.seed),
             t: 0.0,
+            // File text scrolls; a live stdin stream flows on its own.
+            auto_scroll: cfg.text.is_some(),
             cfg,
-            text_grid: Vec::new(),
+            text_canvas: Vec::new(),
             text_version: u64::MAX,
+            scroll: 0.0,
+            jump_in: 14.0,
             cycles: 0,
             merges: 0,
             splits: 0,
@@ -643,17 +654,16 @@ impl World {
         let base = (area / 520.0) * self.cfg.density / (size * size);
         self.target = (base as usize).clamp(2, 40);
         self.rebuild_pools();
-        self.build_text_grid();
+        self.rebuild_text_canvas();
     }
 
-    /// Lay the configured text across the grid, reflowed to the current width,
-    /// so words stay in fixed positions and the wax reveals them as it flows
-    /// over them. Words wrap to the next row and the text repeats to fill the
-    /// screen. Cells with no letter are left blank (they fall back to the glyph
-    /// ramp inside a blob, or stay background outside one).
-    fn build_text_grid(&mut self) {
-        self.text_grid.clear();
-        // Text comes from a live stdin stream if present, else the static file.
+    /// Lay the source text out as a tall canvas of rows wrapped to the current
+    /// width, preserving the file's own line breaks (blank lines become blank
+    /// rows, so paragraphs stay separated and readable). The visible window
+    /// scrolls down through this canvas; see `cell_glyph`. Text comes from a
+    /// live stdin stream if present, else the static file.
+    fn rebuild_text_canvas(&mut self) {
+        self.text_canvas.clear();
         let source = if let Some(stream) = &self.cfg.text_stream {
             let b = stream.lock().unwrap();
             self.text_version = b.version;
@@ -663,33 +673,43 @@ impl World {
         } else {
             return;
         };
-        let words: Vec<Vec<char>> = source.split_whitespace().map(|w| w.chars().collect()).collect();
-        if words.is_empty() {
+        let w = self.w.max(1);
+        let mut canvas: Vec<Vec<char>> = Vec::new();
+        for raw in source.split('\n') {
+            let mut row: Vec<char> = Vec::new();
+            for word in raw.split_whitespace() {
+                let wl = word.chars().count();
+                if !row.is_empty() && row.len() + 1 + wl > w {
+                    canvas.push(std::mem::take(&mut row));
+                }
+                if wl > w {
+                    // Word wider than the screen: hard-break it across rows.
+                    for ch in word.chars() {
+                        if row.len() >= w {
+                            canvas.push(std::mem::take(&mut row));
+                        }
+                        row.push(ch);
+                    }
+                } else {
+                    if !row.is_empty() {
+                        row.push(' ');
+                    }
+                    row.extend(word.chars());
+                }
+            }
+            canvas.push(row); // may be empty -> a blank separator row
+        }
+        // Drop a trailing empty row so the wrap-around isn't a long gap.
+        if canvas.last().map(|r| r.is_empty()).unwrap_or(false) {
+            canvas.pop();
+        }
+        if canvas.iter().all(|r| r.is_empty()) {
             return;
         }
-        let (w, h) = (self.w, self.h);
-        let mut grid = vec![' '; w * h];
-        let mut wi = 0usize;
-        for row in 0..h {
-            let mut col = 0usize;
-            while col < w {
-                let word = &words[wi % words.len()];
-                let wl = word.len();
-                // Wrap a word that won't fit on the rest of this row (unless the
-                // row is empty and the word is simply too long — then truncate).
-                if col > 0 && col + wl > w && wl <= w {
-                    break;
-                }
-                for (k, &ch) in word.iter().enumerate() {
-                    if col + k < w {
-                        grid[row * w + col + k] = ch;
-                    }
-                }
-                wi += 1;
-                col += wl + 1; // trailing space between words
-            }
+        self.text_canvas = canvas;
+        if self.scroll >= self.text_canvas.len() as f32 {
+            self.scroll = 0.0;
         }
-        self.text_grid = grid;
     }
 
     fn rebuild_pools(&mut self) {
@@ -783,7 +803,7 @@ impl World {
         if let Some(stream) = &self.cfg.text_stream {
             let v = stream.lock().unwrap().version;
             if v != self.text_version {
-                self.build_text_grid();
+                self.rebuild_text_canvas();
             }
         }
         if self.cfg.paused {
@@ -800,6 +820,22 @@ impl World {
     fn step(&mut self, dt: f32) {
         self.t += dt;
         let (w, h) = (self.w as f32, self.h as f32);
+
+        // Scroll the revealed text slowly down through the canvas so file mode
+        // flows, with occasional jumps to a random passage for variety. Paused
+        // and speed settings carry through (this runs inside the stepped loop).
+        if self.auto_scroll && !self.text_canvas.is_empty() {
+            let n = self.text_canvas.len() as f32;
+            self.scroll += dt * SCROLL_ROWS_PER_SEC;
+            if self.scroll >= n {
+                self.scroll -= n; // wrap around seamlessly
+            }
+            self.jump_in -= dt;
+            if self.jump_in <= 0.0 {
+                self.scroll = (self.rng.f32() * n).floor();
+                self.jump_in = self.rng.range(12.0, 26.0);
+            }
+        }
 
         // Like-temperature blobs gently draw together and share momentum, so
         // they slide into a merge instead of snapping across a gap.
@@ -1091,12 +1127,17 @@ fn ramp_char(ramp: &[char], i: f32) -> char {
 }
 
 /// The glyph for a filled cell: a letter from the revealed text if one sits
-/// here, otherwise the density-ramp glyph. Word gaps inside a blob fall back to
-/// the ramp so the wax body stays solid.
-fn cell_glyph(world: &World, idx: usize, dens: f32) -> char {
-    if let Some(&c) = world.text_grid.get(idx) {
-        if c != ' ' {
-            return c;
+/// here, otherwise the density-ramp glyph. The text canvas scrolls, so the
+/// visible row maps to `floor(scroll) + row` (wrapping around the canvas).
+/// Word gaps inside a blob fall back to the ramp so the wax body stays solid.
+fn cell_glyph(world: &World, col: usize, row: usize, dens: f32) -> char {
+    let n = world.text_canvas.len();
+    if n > 0 {
+        let cr = (world.scroll as usize + row) % n;
+        if let Some(&c) = world.text_canvas[cr].get(col) {
+            if c != ' ' {
+                return c;
+            }
         }
     }
     ramp_char(world.cfg.ramp, dens)
@@ -1120,7 +1161,7 @@ fn render_ansi(world: &World, buf: &mut String) {
                 continue;
             }
             let dens = intensity(field);
-            let ch = cell_glyph(world, row * world.w + col, dens);
+            let ch = cell_glyph(world, col, row, dens);
             if cfg.color {
                 // Density drives the glyph; colour follows density but drifts a
                 // little with temperature to keep the wax alive within one hue.
@@ -1156,7 +1197,7 @@ fn glyph_grid(world: &World) -> Vec<char> {
             g.push(if field < FIELD_LO {
                 ' '
             } else {
-                cell_glyph(world, row * world.w + col, intensity(field))
+                cell_glyph(world, col, row, intensity(field))
             });
         }
     }
@@ -1483,17 +1524,18 @@ fn run_interactive(cfg: Config) -> io::Result<()> {
 /// a pipe and no static text was given. Keyboard input is unaffected because
 /// crossterm reads it from /dev/tty when stdin isn't a tty.
 fn attach_text_stream(cfg: &mut Config) {
-    // A static --text file/PDF takes precedence over any pipe. Otherwise, if
-    // stdin is a pipe, stream it (this also moves /dev/tty onto stdin so
-    // crossterm's key input keeps working). `stdin_text` just marks intent.
     let _ = cfg.stdin_text;
-    if cfg.text.is_some() {
-        return;
-    }
+    // Whenever stdin is a pipe, move the real terminal onto fd 0 so crossterm's
+    // key/resize input works (see take_piped_stdin). This must happen even when
+    // a static --text file/PDF is given (e.g. `foo | lavalamp --text bar.txt`).
     if let Some(reader) = take_piped_stdin() {
-        let buf = Arc::new(Mutex::new(TextBuffer::new()));
-        spawn_stdin_reader(Arc::clone(&buf), reader);
-        cfg.text_stream = Some(buf);
+        // Stream the piped text only if no static source takes precedence.
+        if cfg.text.is_none() {
+            let buf = Arc::new(Mutex::new(TextBuffer::new()));
+            spawn_stdin_reader(Arc::clone(&buf), reader);
+            cfg.text_stream = Some(buf);
+        }
+        // else: static --text wins; drop the pipe reader (closes the saved fd).
     }
 }
 
