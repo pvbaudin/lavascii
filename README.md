@@ -40,9 +40,10 @@ With `--text`, the file's words are laid across the screen and the flowing wax
 reveals them where it covers them (colored by density); word gaps inside a blob
 fall back to the glyph ramp so the wax still looks solid. The file is wrapped
 into a tall canvas and the visible window **scrolls slowly downward** through it
-(about one line every 1.5s), with occasional jumps to a random passage — so the
-lamp keeps drifting through the whole file, staying dynamic but readable rather
-than frozen on the opening lines. The file can be a plain-text file (any
+(about one line every 1.5s at the default rate), looping seamlessly back to the
+top when it reaches the end — so the lamp keeps drifting through the whole file,
+staying dynamic but readable rather than frozen on the opening lines. Tune the
+pace with `--text-speed <rows/sec>` (`0` holds it static). The file can be a plain-text file (any
 encoding — non-UTF-8 is read lossily) or a **PDF** (text is extracted
 automatically; scanned/image-only PDFs have no selectable text). Preview any
 combination without a live terminal by adding `--test`, e.g.

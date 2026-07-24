@@ -619,7 +619,6 @@ struct World {
     text_version: u64,           // version of the streamed text last laid out
     auto_scroll: bool,           // scroll through the canvas (file mode)
     scroll: f32,                 // current top row into the canvas
-    jump_in: f32,                // seconds until the next random jump
     cycles: u32, // total pool absorptions — a liveness counter for --test
     merges: u32, // diagnostics
     splits: u32,
@@ -642,7 +641,6 @@ impl World {
             text_canvas: Vec::new(),
             text_version: u64::MAX,
             scroll: 0.0,
-            jump_in: 14.0,
             cycles: 0,
             merges: 0,
             splits: 0,
@@ -838,12 +836,7 @@ impl World {
             let n = self.text_canvas.len() as f32;
             self.scroll += dt * self.cfg.text_speed;
             if self.scroll >= n {
-                self.scroll -= n; // wrap around seamlessly
-            }
-            self.jump_in -= dt;
-            if self.jump_in <= 0.0 {
-                self.scroll = (self.rng.f32() * n).floor();
-                self.jump_in = self.rng.range(12.0, 26.0);
+                self.scroll -= n; // reached the end -> loop back to the beginning
             }
         }
 
