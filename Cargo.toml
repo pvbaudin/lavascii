@@ -6,8 +6,8 @@ description = "A full-color ASCII lava lamp for your terminal"
 
 [dependencies]
 crossterm = "0.28"
+pdf-extract = "0.7"
 
 [profile.release]
 opt-level = 3
 lto = true
-panic = "abort"

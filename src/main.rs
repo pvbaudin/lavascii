@@ -260,7 +260,7 @@ OPTIONS:
     -z, --size <F>        Blob-size multiplier (0.3–2)            [default: 1.0]
     -f, --fps <N>         Target frame rate (5–120)               [default: 30]
     -r, --ramp <NAME>     Glyph ramp: ascii, blocks, dots, shade  [default: ascii]
-    -t, --text <FILE>     Reveal words from a text file in the wax
+    -t, --text <FILE>     Reveal words from a text file or PDF in the wax
         --mono            Monochrome (no color, just glyphs)
         --seed <N>        Fixed PRNG seed (reproducible)
     -h, --help            Print this help
@@ -280,6 +280,31 @@ EXAMPLES:
     lavalamp --scheme rainbow --ramp blocks
     lavalamp --text poem.txt --scheme ember
 ";
+
+/// Load the words for `--text` from a file. Handles PDFs (extracted with a
+/// pure-Rust parser) as well as plain-text files in any encoding — non-UTF-8
+/// text is read lossily rather than rejected. PDF detection is by extension or
+/// the `%PDF-` magic bytes, and a malformed PDF is reported instead of crashing.
+fn load_text(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+    let is_pdf = path.to_lowercase().ends_with(".pdf") || bytes.starts_with(b"%PDF-");
+    if is_pdf {
+        // pdf-extract can panic on malformed input, so isolate it.
+        let extracted = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
+            .map_err(|_| format!("could not parse PDF '{path}' (malformed or unsupported)"))?;
+        let text = extracted
+            .map_err(|e| format!("could not extract text from PDF '{path}': {e}"))?;
+        if text.split_whitespace().next().is_none() {
+            return Err(format!(
+                "no selectable text in PDF '{path}' (it may be scanned/image-only)"
+            ));
+        }
+        Ok(text)
+    } else {
+        // Any other file: treat as text, tolerating non-UTF-8 bytes.
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
 
 /// Fetch an option's value, supporting both `--key val` and `--key=val`.
 fn take_val(
@@ -355,10 +380,9 @@ fn parse_args() -> Result<Option<Config>, String> {
             }
             "-t" | "--text" => {
                 let path = take_val(&args, &mut i, &inline, "--text")?;
-                let body = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read text file '{path}': {e}"))?;
+                let body = load_text(&path)?;
                 if body.split_whitespace().next().is_none() {
-                    return Err(format!("text file '{path}' has no words"));
+                    return Err(format!("'{path}' has no extractable words"));
                 }
                 cfg.text = Some(body);
             }

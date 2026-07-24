@@ -38,9 +38,11 @@ lavalamp --text poem.txt -c ember         # wax reveals your words
 
 With `--text`, the file's words are laid across the screen and the flowing wax
 reveals them where it covers them (colored by density); word gaps inside a blob
-fall back to the glyph ramp so the wax still looks solid. Preview any
-combination without a live terminal by adding `--test`, e.g.
-`lavalamp --test --text poem.txt`.
+fall back to the glyph ramp so the wax still looks solid. The file can be a
+plain-text file (any encoding — non-UTF-8 is read lossily) or a **PDF** (text is
+extracted automatically; scanned/image-only PDFs have no selectable text).
+Preview any combination without a live terminal by adding `--test`, e.g.
+`lavalamp --test --text paper.pdf`.
 
 Resize the window any time — the scene reflows and rescales live.
 
@@ -54,7 +56,7 @@ Resize the window any time — the scene reflows and rescales live.
 | `-z` | `--size <F>` | Blob-size multiplier (0.3–2) | `1.0` |
 | `-f` | `--fps <N>` | Target frame rate (5–120) | `30` |
 | `-r` | `--ramp <NAME>` | Glyph ramp: `ascii`, `blocks`, `dots`, `shade` | `ascii` |
-| `-t` | `--text <FILE>` | Reveal the words from a text file in the wax | |
+| `-t` | `--text <FILE>` | Reveal the words from a text file or PDF in the wax | |
 |  | `--mono` | Monochrome (no color, just glyphs) | |
 |  | `--seed <N>` | Fixed PRNG seed (reproducible) | random |
 | `-h` | `--help` | Print help | |
