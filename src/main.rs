@@ -297,8 +297,23 @@ fn take_piped_stdin() -> Option<Box<dyn io::Read + Send>> {
         if pipe < 0 {
             return None;
         }
-        // Put the controlling terminal on stdin for crossterm's key/resize input.
-        if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        // Point stdin at the real terminal so crossterm can read keys/resize.
+        // Prefer duplicating an already-open tty fd (stdout/stderr) — that's the
+        // actual terminal *device*, which kqueue can poll. Opening "/dev/tty"
+        // instead yields the controlling-terminal alias, which mio/kqueue can't
+        // register on macOS (crossterm then fails to init its input reader).
+        let tty_src = if libc::isatty(libc::STDOUT_FILENO) == 1 {
+            libc::STDOUT_FILENO
+        } else if libc::isatty(libc::STDERR_FILENO) == 1 {
+            libc::STDERR_FILENO
+        } else {
+            -1
+        };
+        if tty_src >= 0 {
+            libc::dup2(tty_src, libc::STDIN_FILENO);
+        } else if let Ok(tty) =
+            std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty")
+        {
             let tfd = tty.into_raw_fd();
             libc::dup2(tfd, libc::STDIN_FILENO);
             libc::close(tfd);
