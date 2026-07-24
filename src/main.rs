@@ -38,6 +38,7 @@ const COHESION: f32 = 6.0; // like-temp attraction that draws blobs together
 const VISC: f32 = 2.5; // relative-velocity damping between close blobs
 const MELT_PULL: f32 = 3.0; // how fast a dying blob flows toward its sink point
 const SCROLL_ROWS_PER_SEC: f32 = 0.7; // default text scroll speed in file mode (rows/s)
+const STREAM_SCROLL_EASE: f32 = 6.0; // how fast the live view eases to new lines
 
 // ---- configuration (CLI) --------------------------------------------------
 
@@ -217,49 +218,32 @@ fn ramp_by_name(s: &str) -> Option<&'static [char]> {
     }
 }
 
-/// A bounded ring of the most-recently-seen *lines*, fed live from stdin. Old
-/// lines are dropped once the total length exceeds `TEXT_CAP`, so a long or
-/// endless stream (`tail -f …`) stays bounded. Storing whole finalized lines
-/// (rather than loose words) keeps the layout stable — appending a line never
-/// re-wraps the earlier ones — so a live feed scrolls smoothly instead of
-/// reflowing on every word. `version` bumps on every change.
-const TEXT_CAP: usize = 8192; // ~chars retained
+/// An inbox of finalized lines fed live from stdin. The renderer drains new
+/// lines each frame and appends them to its scrollback incrementally, so the
+/// existing layout never re-wraps — a live feed scrolls smoothly instead of
+/// jumping. Bounded by line count in case the renderer ever falls behind.
+const INBOX_CAP: usize = 1024; // max undrained lines held
 struct TextBuffer {
-    lines: std::collections::VecDeque<String>,
-    total: usize,
-    version: u64,
+    pending: std::collections::VecDeque<String>,
 }
 
 impl TextBuffer {
     fn new() -> Self {
         TextBuffer {
-            lines: std::collections::VecDeque::new(),
-            total: 0,
-            version: 0,
+            pending: std::collections::VecDeque::new(),
         }
     }
     fn push_line(&mut self, line: String) {
         if line.is_empty() {
             return;
         }
-        self.total += line.len() + 1;
-        self.lines.push_back(line);
-        while self.total > TEXT_CAP && self.lines.len() > 1 {
-            if let Some(old) = self.lines.pop_front() {
-                self.total -= old.len() + 1;
-            }
+        self.pending.push_back(line);
+        while self.pending.len() > INBOX_CAP {
+            self.pending.pop_front();
         }
-        self.version += 1;
     }
-    fn snapshot(&self) -> String {
-        let mut s = String::with_capacity(self.total);
-        for (i, l) in self.lines.iter().enumerate() {
-            if i > 0 {
-                s.push('\n');
-            }
-            s.push_str(l);
-        }
-        s
+    fn drain(&mut self) -> Vec<String> {
+        self.pending.drain(..).collect()
     }
 }
 
@@ -671,9 +655,9 @@ struct World {
     // window scrolls slowly down through it (with occasional random jumps) so
     // file mode flows dynamically instead of showing a static beginning.
     text_canvas: Vec<Vec<char>>, // wrapped rows of the source (empty = glyph ramp)
-    text_version: u64,           // version of the streamed text last laid out
-    auto_scroll: bool,           // scroll through the canvas (file mode)
+    auto_scroll: bool,           // scroll/loop through the canvas (file mode)
     scroll: f32,                 // current top row into the canvas
+    scroll_target: f32,          // stream mode: eased-to bottom anchor
     cycles: u32, // total pool absorptions — a liveness counter for --test
     merges: u32, // diagnostics
     splits: u32,
@@ -694,8 +678,8 @@ impl World {
             auto_scroll: cfg.text.is_some(),
             cfg,
             text_canvas: Vec::new(),
-            text_version: u64::MAX,
             scroll: 0.0,
+            scroll_target: 0.0,
             cycles: 0,
             merges: 0,
             splits: 0,
@@ -717,74 +701,94 @@ impl World {
         let base = (area / 520.0) * self.cfg.density / (size * size);
         self.target = (base as usize).clamp(2, 40);
         self.rebuild_pools();
-        self.rebuild_text_canvas();
+        if self.cfg.text_stream.is_some() {
+            // A live stream builds its canvas incrementally (see pump_stream).
+            // On a resize the existing rows were wrapped to the old width, so
+            // start fresh; new lines refill at the new width.
+            self.text_canvas.clear();
+            self.scroll = 0.0;
+            self.scroll_target = 0.0;
+        } else {
+            self.rebuild_text_canvas();
+        }
     }
 
-    /// Lay the source text out as a tall canvas of rows wrapped to the current
-    /// width, preserving the file's own line breaks (blank lines become blank
-    /// rows, so paragraphs stay separated and readable). The visible window
-    /// scrolls down through this canvas; see `cell_glyph`. Text comes from a
-    /// live stdin stream if present, else the static file.
+    /// Append `line`'s wrapped rows (width `w`) to `canvas`. Always adds at
+    /// least one row per line. Words wider than the screen are hard-broken.
+    fn wrap_line(line: &str, w: usize, canvas: &mut Vec<Vec<char>>) {
+        let mut row: Vec<char> = Vec::new();
+        for word in sanitize_line(line).split_whitespace() {
+            let wl = word.chars().count();
+            if !row.is_empty() && row.len() + 1 + wl > w {
+                canvas.push(std::mem::take(&mut row));
+            }
+            if wl > w {
+                for ch in word.chars() {
+                    if row.len() >= w {
+                        canvas.push(std::mem::take(&mut row));
+                    }
+                    row.push(ch);
+                }
+            } else {
+                if !row.is_empty() {
+                    row.push(' ');
+                }
+                row.extend(word.chars());
+            }
+        }
+        canvas.push(row); // may be empty -> a blank separator row
+    }
+
+    /// Lay a static --text file out as a tall canvas of rows wrapped to the
+    /// current width, preserving the file's own line breaks. The visible window
+    /// scrolls (and loops) down through this canvas; see `cell_glyph`.
     fn rebuild_text_canvas(&mut self) {
         self.text_canvas.clear();
-        let source = if let Some(stream) = &self.cfg.text_stream {
-            let b = stream.lock().unwrap();
-            self.text_version = b.version;
-            b.snapshot()
-        } else if let Some(t) = &self.cfg.text {
-            t.clone()
-        } else {
-            return;
+        let source = match &self.cfg.text {
+            Some(t) => t.clone(),
+            None => return,
         };
         let w = self.w.max(1);
         let mut canvas: Vec<Vec<char>> = Vec::new();
         for raw in source.split('\n') {
-            // Strip ANSI escapes / control chars first: live inputs (e.g. a
-            // voice-to-text feed) rewrite their line with escape sequences, and
-            // emitting those into our frame would corrupt the terminal.
-            let clean = sanitize_line(raw);
-            let mut row: Vec<char> = Vec::new();
-            for word in clean.split_whitespace() {
-                let wl = word.chars().count();
-                if !row.is_empty() && row.len() + 1 + wl > w {
-                    canvas.push(std::mem::take(&mut row));
-                }
-                if wl > w {
-                    // Word wider than the screen: hard-break it across rows.
-                    for ch in word.chars() {
-                        if row.len() >= w {
-                            canvas.push(std::mem::take(&mut row));
-                        }
-                        row.push(ch);
-                    }
-                } else {
-                    if !row.is_empty() {
-                        row.push(' ');
-                    }
-                    row.extend(word.chars());
-                }
-            }
-            canvas.push(row); // may be empty -> a blank separator row
+            Self::wrap_line(raw, w, &mut canvas);
         }
-        // Drop a trailing empty row so the wrap-around isn't a long gap.
         if canvas.last().map(|r| r.is_empty()).unwrap_or(false) {
-            canvas.pop();
+            canvas.pop(); // trailing blank -> no long gap at the wrap point
         }
         if canvas.iter().all(|r| r.is_empty()) {
             return;
         }
         self.text_canvas = canvas;
-        let n = self.text_canvas.len();
-        if self.auto_scroll {
-            // File mode scrolls/loops; just keep the offset in range.
-            if self.scroll >= n as f32 {
-                self.scroll = 0.0;
-            }
-        } else {
-            // Live stream: anchor to the bottom so the newest lines stay in
-            // view and older ones scroll up off the top (like a log tail).
-            self.scroll = n.saturating_sub(self.h) as f32;
+        if self.scroll >= self.text_canvas.len() as f32 {
+            self.scroll = 0.0;
         }
+    }
+
+    /// Drain newly-arrived stream lines and append them to the scrollback,
+    /// incrementally, so existing rows never re-wrap or re-index. Caps the
+    /// scrollback and shifts `scroll` to match dropped rows, and updates the
+    /// bottom anchor `scroll_target` that the view eases toward.
+    fn pump_stream(&mut self) {
+        let Some(stream) = self.cfg.text_stream.clone() else {
+            return;
+        };
+        let new_lines = match stream.lock() {
+            Ok(mut b) => b.drain(),
+            Err(_) => return,
+        };
+        let w = self.w.max(1);
+        for line in new_lines {
+            Self::wrap_line(&line, w, &mut self.text_canvas);
+        }
+        // Keep a bounded scrollback (a screenful plus some history).
+        let max_rows = self.h + 300;
+        if self.text_canvas.len() > max_rows {
+            let drop = self.text_canvas.len() - max_rows;
+            self.text_canvas.drain(0..drop);
+            self.scroll = (self.scroll - drop as f32).max(0.0);
+        }
+        self.scroll_target = (self.text_canvas.len() as f32 - self.h as f32).max(0.0);
     }
 
     fn rebuild_pools(&mut self) {
@@ -872,15 +876,9 @@ impl World {
     /// the configured speed. Large or fast steps are split into sub-steps of at
     /// most ~20ms so the physics stays stable at any speed.
     fn update(&mut self, real_dt: f32) {
-        // Rebuild the revealed text if the live stream has advanced (cheap; only
-        // when new stdin data has arrived). Done even while paused so freshly
-        // piped text still appears.
-        if let Some(stream) = &self.cfg.text_stream {
-            let v = stream.lock().unwrap().version;
-            if v != self.text_version {
-                self.rebuild_text_canvas();
-            }
-        }
+        // Ingest any newly-arrived stream lines (even while paused, so freshly
+        // piped text is captured); the eased scroll happens in step().
+        self.pump_stream();
         if self.cfg.paused {
             return;
         }
@@ -896,15 +894,20 @@ impl World {
         self.t += dt;
         let (w, h) = (self.w as f32, self.h as f32);
 
-        // Scroll the revealed text slowly down through the canvas so file mode
-        // flows, with occasional jumps to a random passage for variety. Paused
-        // and speed settings carry through (this runs inside the stepped loop).
-        if self.auto_scroll && self.cfg.text_speed > 0.0 && !self.text_canvas.is_empty() {
-            let n = self.text_canvas.len() as f32;
-            self.scroll += dt * self.cfg.text_speed;
-            if self.scroll >= n {
-                self.scroll -= n; // reached the end -> loop back to the beginning
+        // Text scroll. File mode drifts down at a steady rate and loops. A live
+        // stream instead *eases* toward the newest line (scroll_target), so new
+        // lines glide smoothly into view from the bottom instead of the whole
+        // display snapping vertically each time a line arrives.
+        if self.auto_scroll {
+            if self.cfg.text_speed > 0.0 && !self.text_canvas.is_empty() {
+                let n = self.text_canvas.len() as f32;
+                self.scroll += dt * self.cfg.text_speed;
+                if self.scroll >= n {
+                    self.scroll -= n; // reached the end -> loop back to the start
+                }
             }
+        } else if self.cfg.text_stream.is_some() {
+            self.scroll += (self.scroll_target - self.scroll) * (STREAM_SCROLL_EASE * dt).min(1.0);
         }
 
         // Like-temperature blobs gently draw together and share momentum, so
