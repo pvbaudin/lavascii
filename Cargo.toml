@@ -8,6 +8,9 @@ description = "A full-color ASCII lava lamp for your terminal"
 crossterm = "0.28"
 pdf-extract = "0.7"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = true

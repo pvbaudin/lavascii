@@ -16,9 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal,
-    tty::IsTty,
-    ExecutableCommand,
+    terminal, ExecutableCommand,
 };
 
 /// Terminal cells are roughly twice as tall as they are wide. We scale
@@ -259,17 +257,16 @@ impl TextBuffer {
     }
 }
 
-/// Spawn a thread that reads stdin line-by-line into the shared ring buffer.
+/// Spawn a thread that reads `reader` line-by-line into the shared ring buffer.
 /// Works for both a one-shot pipe (`echo … | lavalamp`, read to EOF) and a live
-/// feed (`tail -f log | lavalamp`). Keyboard input is unaffected — crossterm
-/// reads it from /dev/tty when stdin is a pipe.
-fn spawn_stdin_reader(buf: Arc<Mutex<TextBuffer>>) {
+/// feed (`tail -f log | lavalamp`).
+fn spawn_stdin_reader(buf: Arc<Mutex<TextBuffer>>, reader: Box<dyn io::Read + Send>) {
     std::thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
+        let mut r = io::BufReader::new(reader);
         let mut line = String::new();
         loop {
             line.clear();
-            match stdin.read_line(&mut line) {
+            match r.read_line(&mut line) {
                 Ok(0) | Err(_) => break, // EOF or error: stop, keep what we have
                 Ok(_) => {
                     if let Ok(mut b) = buf.lock() {
@@ -281,6 +278,43 @@ fn spawn_stdin_reader(buf: Arc<Mutex<TextBuffer>>) {
             }
         }
     });
+}
+
+/// If stdin is a pipe, hand back a reader for the piped data. On Unix this also
+/// transplants the controlling terminal (`/dev/tty`) onto fd 0 first, so that
+/// crossterm sees stdin as a tty and takes its normal, well-tested input path —
+/// otherwise crossterm tries to open /dev/tty itself and fails to initialize
+/// its event reader (notably on macOS). Returns None when stdin is a terminal
+/// (nothing piped) so normal interactive use is untouched.
+#[cfg(unix)]
+fn take_piped_stdin() -> Option<Box<dyn io::Read + Send>> {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    unsafe {
+        if libc::isatty(libc::STDIN_FILENO) == 1 {
+            return None; // stdin is the terminal: nothing to stream
+        }
+        let pipe = libc::dup(libc::STDIN_FILENO); // save the piped input
+        if pipe < 0 {
+            return None;
+        }
+        // Put the controlling terminal on stdin for crossterm's key/resize input.
+        if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            let tfd = tty.into_raw_fd();
+            libc::dup2(tfd, libc::STDIN_FILENO);
+            libc::close(tfd);
+        }
+        Some(Box::new(std::fs::File::from_raw_fd(pipe)))
+    }
+}
+
+#[cfg(not(unix))]
+fn take_piped_stdin() -> Option<Box<dyn io::Read + Send>> {
+    use crossterm::tty::IsTty;
+    if io::stdin().is_tty() {
+        None
+    } else {
+        Some(Box::new(io::stdin()))
+    }
 }
 
 /// Runtime configuration assembled from CLI arguments.
@@ -1430,13 +1464,16 @@ fn run_interactive(cfg: Config) -> io::Result<()> {
 /// a pipe and no static text was given. Keyboard input is unaffected because
 /// crossterm reads it from /dev/tty when stdin isn't a tty.
 fn attach_text_stream(cfg: &mut Config) {
-    // Only stream when stdin is genuinely a pipe. Reading a tty stdin would
-    // steal the keystrokes crossterm needs, so `--text -` without a real pipe
-    // simply falls back to the normal glyph ramp. `stdin_text` marks intent.
+    // A static --text file/PDF takes precedence over any pipe. Otherwise, if
+    // stdin is a pipe, stream it (this also moves /dev/tty onto stdin so
+    // crossterm's key input keeps working). `stdin_text` just marks intent.
     let _ = cfg.stdin_text;
-    if cfg.text.is_none() && !io::stdin().is_tty() {
+    if cfg.text.is_some() {
+        return;
+    }
+    if let Some(reader) = take_piped_stdin() {
         let buf = Arc::new(Mutex::new(TextBuffer::new()));
-        spawn_stdin_reader(Arc::clone(&buf));
+        spawn_stdin_reader(Arc::clone(&buf), reader);
         cfg.text_stream = Some(buf);
     }
 }
