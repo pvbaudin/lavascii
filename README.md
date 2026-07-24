@@ -44,6 +44,19 @@ extracted automatically; scanned/image-only PDFs have no selectable text).
 Preview any combination without a live terminal by adding `--test`, e.g.
 `lavalamp --test --text paper.pdf`.
 
+You can also feed text **live from stdin** — just pipe into `lavalamp` (or pass
+`--text -`). Incoming words flow into a bounded ring buffer (the most recent
+~8 KB), so an endless feed stays light and always shows the latest text:
+
+```sh
+echo "hello lava world" | lavalamp
+tail -f /var/log/system.log | lavalamp -c green   # watch logs goop by
+fortune | lavalamp --scheme sunset
+```
+
+Keyboard controls still work while piping (they're read from the terminal, not
+stdin).
+
 Resize the window any time — the scene reflows and rescales live.
 
 ### Options

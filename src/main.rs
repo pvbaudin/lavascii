@@ -9,13 +9,16 @@
 //! would otherwise let a blob get stranded, neither hot nor cold, in the
 //! middle).
 
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal, ExecutableCommand,
+    terminal,
+    tty::IsTty,
+    ExecutableCommand,
 };
 
 /// Terminal cells are roughly twice as tall as they are wide. We scale
@@ -215,6 +218,71 @@ fn ramp_by_name(s: &str) -> Option<&'static [char]> {
     }
 }
 
+/// A bounded ring of the most-recently-seen words, fed live from stdin. Old
+/// words are dropped once the total length exceeds `TEXT_CAP`, so a long or
+/// endless stream (`tail -f …`) stays bounded. `version` bumps on every change
+/// so the renderer knows when to rebuild.
+const TEXT_CAP: usize = 8192; // ~chars retained
+struct TextBuffer {
+    words: std::collections::VecDeque<String>,
+    total: usize,
+    version: u64,
+}
+
+impl TextBuffer {
+    fn new() -> Self {
+        TextBuffer {
+            words: std::collections::VecDeque::new(),
+            total: 0,
+            version: 0,
+        }
+    }
+    fn push(&mut self, word: &str) {
+        self.words.push_back(word.to_string());
+        self.total += word.len() + 1;
+        while self.total > TEXT_CAP && self.words.len() > 1 {
+            if let Some(old) = self.words.pop_front() {
+                self.total -= old.len() + 1;
+            }
+        }
+        self.version += 1;
+    }
+    fn snapshot(&self) -> String {
+        let mut s = String::with_capacity(self.total);
+        for (i, w) in self.words.iter().enumerate() {
+            if i > 0 {
+                s.push(' ');
+            }
+            s.push_str(w);
+        }
+        s
+    }
+}
+
+/// Spawn a thread that reads stdin line-by-line into the shared ring buffer.
+/// Works for both a one-shot pipe (`echo … | lavalamp`, read to EOF) and a live
+/// feed (`tail -f log | lavalamp`). Keyboard input is unaffected — crossterm
+/// reads it from /dev/tty when stdin is a pipe.
+fn spawn_stdin_reader(buf: Arc<Mutex<TextBuffer>>) {
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdin.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // EOF or error: stop, keep what we have
+                Ok(_) => {
+                    if let Ok(mut b) = buf.lock() {
+                        for w in line.split_whitespace() {
+                            b.push(w);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Runtime configuration assembled from CLI arguments.
 #[derive(Clone)]
 struct Config {
@@ -227,7 +295,9 @@ struct Config {
     color: bool,     // truecolor vs. plain glyphs
     paused: bool,    // interactive pause
     seed: u64,       // PRNG seed
-    text: Option<String>, // if set, the wax reveals these words instead of glyphs
+    text: Option<String>, // static text (file/PDF) the wax reveals instead of glyphs
+    stdin_text: bool,     // read the revealed text live from stdin (`--text -` or a pipe)
+    text_stream: Option<Arc<Mutex<TextBuffer>>>, // live text ring, when streaming
 }
 
 impl Default for Config {
@@ -243,6 +313,8 @@ impl Default for Config {
             paused: false,
             seed: 0x1234_5678,
             text: None,
+            stdin_text: false,
+            text_stream: None,
         }
     }
 }
@@ -261,6 +333,7 @@ OPTIONS:
     -f, --fps <N>         Target frame rate (5–120)               [default: 30]
     -r, --ramp <NAME>     Glyph ramp: ascii, blocks, dots, shade  [default: ascii]
     -t, --text <FILE>     Reveal words from a text file or PDF in the wax
+                          (use `-` to read live from stdin; piping in also works)
         --mono            Monochrome (no color, just glyphs)
         --seed <N>        Fixed PRNG seed (reproducible)
     -h, --help            Print this help
@@ -279,6 +352,7 @@ EXAMPLES:
     lavalamp -c ember -d 1.5 -f 60
     lavalamp --scheme rainbow --ramp blocks
     lavalamp --text poem.txt --scheme ember
+    tail -f app.log | lavalamp -c green        # live log in the wax
 ";
 
 /// Load the words for `--text` from a file. Handles PDFs (extracted with a
@@ -380,11 +454,15 @@ fn parse_args() -> Result<Option<Config>, String> {
             }
             "-t" | "--text" => {
                 let path = take_val(&args, &mut i, &inline, "--text")?;
-                let body = load_text(&path)?;
-                if body.split_whitespace().next().is_none() {
-                    return Err(format!("'{path}' has no extractable words"));
+                if path == "-" {
+                    cfg.stdin_text = true; // read the text live from stdin
+                } else {
+                    let body = load_text(&path)?;
+                    if body.split_whitespace().next().is_none() {
+                        return Err(format!("'{path}' has no extractable words"));
+                    }
+                    cfg.text = Some(body);
                 }
-                cfg.text = Some(body);
             }
             "--mono" => cfg.color = false,
             "--seed" => {
@@ -471,6 +549,7 @@ struct World {
     t: f32,
     cfg: Config,
     text_grid: Vec<char>, // per-cell words to reveal (empty = use the glyph ramp)
+    text_version: u64,    // version of the streamed text last built into the grid
     cycles: u32, // total pool absorptions — a liveness counter for --test
     merges: u32, // diagnostics
     splits: u32,
@@ -489,6 +568,7 @@ impl World {
             t: 0.0,
             cfg,
             text_grid: Vec::new(),
+            text_version: u64::MAX,
             cycles: 0,
             merges: 0,
             splits: 0,
@@ -520,10 +600,17 @@ impl World {
     /// ramp inside a blob, or stay background outside one).
     fn build_text_grid(&mut self) {
         self.text_grid.clear();
-        let words: Vec<Vec<char>> = match &self.cfg.text {
-            Some(t) => t.split_whitespace().map(|w| w.chars().collect()).collect(),
-            None => return,
+        // Text comes from a live stdin stream if present, else the static file.
+        let source = if let Some(stream) = &self.cfg.text_stream {
+            let b = stream.lock().unwrap();
+            self.text_version = b.version;
+            b.snapshot()
+        } else if let Some(t) = &self.cfg.text {
+            t.clone()
+        } else {
+            return;
         };
+        let words: Vec<Vec<char>> = source.split_whitespace().map(|w| w.chars().collect()).collect();
         if words.is_empty() {
             return;
         }
@@ -637,6 +724,15 @@ impl World {
     /// the configured speed. Large or fast steps are split into sub-steps of at
     /// most ~20ms so the physics stays stable at any speed.
     fn update(&mut self, real_dt: f32) {
+        // Rebuild the revealed text if the live stream has advanced (cheap; only
+        // when new stdin data has arrived). Done even while paused so freshly
+        // piped text still appears.
+        if let Some(stream) = &self.cfg.text_stream {
+            let v = stream.lock().unwrap().version;
+            if v != self.text_version {
+                self.build_text_grid();
+            }
+        }
         if self.cfg.paused {
             return;
         }
@@ -1171,8 +1267,13 @@ fn run_test() {
     let (w, h) = (80usize, 40usize);
     // Honour CLI options (scheme/text/etc.) so --test doubles as a headless
     // preview, but pin the seed for deterministic diagnostics.
-    let cfg = parse_args().ok().flatten().unwrap_or_default();
-    let mut world = World::new(w, h, Config { seed: 0x1234_5678, ..cfg });
+    let mut cfg = parse_args().ok().flatten().unwrap_or_default();
+    cfg.seed = 0x1234_5678;
+    attach_text_stream(&mut cfg); // allow piping text in for a headless preview
+    if cfg.text_stream.is_some() {
+        std::thread::sleep(Duration::from_millis(150)); // let the reader drain stdin
+    }
+    let mut world = World::new(w, h, cfg);
     // Warm up so blobs are mid-cycle.
     for _ in 0..400 {
         world.update(0.033);
@@ -1325,6 +1426,21 @@ fn run_interactive(cfg: Config) -> io::Result<()> {
     result
 }
 
+/// Stream the revealed text from stdin when asked (`--text -`) or when stdin is
+/// a pipe and no static text was given. Keyboard input is unaffected because
+/// crossterm reads it from /dev/tty when stdin isn't a tty.
+fn attach_text_stream(cfg: &mut Config) {
+    // Only stream when stdin is genuinely a pipe. Reading a tty stdin would
+    // steal the keystrokes crossterm needs, so `--text -` without a real pipe
+    // simply falls back to the normal glyph ramp. `stdin_text` marks intent.
+    let _ = cfg.stdin_text;
+    if cfg.text.is_none() && !io::stdin().is_tty() {
+        let buf = Arc::new(Mutex::new(TextBuffer::new()));
+        spawn_stdin_reader(Arc::clone(&buf));
+        cfg.text_stream = Some(buf);
+    }
+}
+
 /// Cycle through the named glyph ramps (for the interactive `r` key).
 fn next_ramp(cur: &'static [char]) -> &'static [char] {
     let ramps: [&'static [char]; 4] = [&RAMP_ASCII, &RAMP_BLOCKS, &RAMP_DOTS, &RAMP_SHADE];
@@ -1347,7 +1463,8 @@ fn main() {
         return;
     }
     match parse_args() {
-        Ok(Some(cfg)) => {
+        Ok(Some(mut cfg)) => {
+            attach_text_stream(&mut cfg);
             if let Err(e) = run_interactive(cfg) {
                 let _ = terminal::disable_raw_mode();
                 eprintln!("lavalamp: error: {e}");
