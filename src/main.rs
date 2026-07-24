@@ -37,7 +37,7 @@ const EASE: f32 = 1.6; // radius easing rate (1/s) — smooths merges/melts/birt
 const COHESION: f32 = 6.0; // like-temp attraction that draws blobs together
 const VISC: f32 = 2.5; // relative-velocity damping between close blobs
 const MELT_PULL: f32 = 3.0; // how fast a dying blob flows toward its sink point
-const SCROLL_ROWS_PER_SEC: f32 = 0.7; // text scroll speed in file mode (rows/s)
+const SCROLL_ROWS_PER_SEC: f32 = 0.7; // default text scroll speed in file mode (rows/s)
 
 // ---- configuration (CLI) --------------------------------------------------
 
@@ -349,6 +349,7 @@ struct Config {
     color: bool,     // truecolor vs. plain glyphs
     paused: bool,    // interactive pause
     seed: u64,       // PRNG seed
+    text_speed: f32, // file-mode scroll speed in rows/sec (0 = static)
     text: Option<String>, // static text (file/PDF) the wax reveals instead of glyphs
     stdin_text: bool,     // read the revealed text live from stdin (`--text -` or a pipe)
     text_stream: Option<Arc<Mutex<TextBuffer>>>, // live text ring, when streaming
@@ -366,6 +367,7 @@ impl Default for Config {
             color: true,
             paused: false,
             seed: 0x1234_5678,
+            text_speed: SCROLL_ROWS_PER_SEC,
             text: None,
             stdin_text: false,
             text_stream: None,
@@ -388,6 +390,8 @@ OPTIONS:
     -r, --ramp <NAME>     Glyph ramp: ascii, blocks, dots, shade  [default: ascii]
     -t, --text <FILE>     Reveal words from a text file or PDF in the wax
                           (use `-` to read live from stdin; piping in also works)
+        --text-speed <F>  Scroll speed through a --text file, rows/sec (0 = static)
+                          [default: 0.7]
         --mono            Monochrome (no color, just glyphs)
         --seed <N>        Fixed PRNG seed (reproducible)
     -h, --help            Print this help
@@ -517,6 +521,12 @@ fn parse_args() -> Result<Option<Config>, String> {
                     }
                     cfg.text = Some(body);
                 }
+            }
+            "--text-speed" => {
+                cfg.text_speed = take_val(&args, &mut i, &inline, "--text-speed")?
+                    .parse::<f32>()
+                    .map_err(|_| "--text-speed must be a number")?
+                    .clamp(0.0, 20.0);
             }
             "--mono" => cfg.color = false,
             "--seed" => {
@@ -824,9 +834,9 @@ impl World {
         // Scroll the revealed text slowly down through the canvas so file mode
         // flows, with occasional jumps to a random passage for variety. Paused
         // and speed settings carry through (this runs inside the stepped loop).
-        if self.auto_scroll && !self.text_canvas.is_empty() {
+        if self.auto_scroll && self.cfg.text_speed > 0.0 && !self.text_canvas.is_empty() {
             let n = self.text_canvas.len() as f32;
-            self.scroll += dt * SCROLL_ROWS_PER_SEC;
+            self.scroll += dt * self.cfg.text_speed;
             if self.scroll >= n {
                 self.scroll -= n; // wrap around seamlessly
             }

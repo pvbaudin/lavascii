@@ -74,6 +74,7 @@ Resize the window any time — the scene reflows and rescales live.
 | `-f` | `--fps <N>` | Target frame rate (5–120) | `30` |
 | `-r` | `--ramp <NAME>` | Glyph ramp: `ascii`, `blocks`, `dots`, `shade` | `ascii` |
 | `-t` | `--text <FILE>` | Reveal the words from a text file or PDF in the wax | |
+|  | `--text-speed <F>` | Scroll speed through a `--text` file, rows/sec (`0` = static) | `0.7` |
 |  | `--mono` | Monochrome (no color, just glyphs) | |
 |  | `--seed <N>` | Fixed PRNG seed (reproducible) | random |
 | `-h` | `--help` | Print help | |
