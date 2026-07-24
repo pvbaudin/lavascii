@@ -567,6 +567,50 @@ impl Rng {
     }
 }
 
+/// Remove ANSI escape sequences and control characters from a line of revealed
+/// text. Live inputs (voice-to-text, progress meters, coloured logs) rewrite
+/// their output with `\r`, cursor moves and CSI colour codes; if those bytes
+/// reached our frame they'd corrupt the terminal (jitter) or show as gibberish
+/// fragments like `[2K`. We keep only printable characters.
+fn sanitize_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Escape sequence: skip `ESC [ ... final`, `ESC ] ... BEL/ST`, or a
+            // lone `ESC <char>`.
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('@'..='~').contains(&n) {
+                            break; // CSI final byte
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if n == '\x07' {
+                            break; // BEL terminates OSC
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+        // other control chars are dropped
+    }
+    out
+}
+
 /// A free-floating wax blob.
 #[derive(Clone)]
 struct Blob {
@@ -684,8 +728,12 @@ impl World {
         let w = self.w.max(1);
         let mut canvas: Vec<Vec<char>> = Vec::new();
         for raw in source.split('\n') {
+            // Strip ANSI escapes / control chars first: live inputs (e.g. a
+            // voice-to-text feed) rewrite their line with escape sequences, and
+            // emitting those into our frame would corrupt the terminal.
+            let clean = sanitize_line(raw);
             let mut row: Vec<char> = Vec::new();
-            for word in raw.split_whitespace() {
+            for word in clean.split_whitespace() {
                 let wl = word.chars().count();
                 if !row.is_empty() && row.len() + 1 + wl > w {
                     canvas.push(std::mem::take(&mut row));
@@ -1138,7 +1186,8 @@ fn cell_glyph(world: &World, col: usize, row: usize, dens: f32) -> char {
     if n > 0 {
         let cr = (world.scroll as usize + row) % n;
         if let Some(&c) = world.text_canvas[cr].get(col) {
-            if c != ' ' {
+            // Never emit a space (gap) or a control char into the frame.
+            if c != ' ' && !c.is_control() {
                 return c;
             }
         }
