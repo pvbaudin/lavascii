@@ -1,13 +1,32 @@
-# lavalamp
+# lavascii
 
-A full-color ASCII lava lamp for your terminal, in Rust — in the spirit of
-`asciiquarium` and `cmatrix`. It resizes freely with the window.
+A full-color ASCII lava lamp for your terminal, **written in Rust**, in the
+spirit of `asciiquarium` and `cmatrix`. It resizes freely with the window.
 
-![it goops](https://example.invalid/placeholder)
+**Pipe any text into it** and the words appear inside the wax as it flows:
+logs, speech-to-text, `fortune`, or any other command's output.
+
+```sh
+tail -f /var/log/system.log | lavascii
+```
+
+![lavascii running in a terminal](docs/screenshots/lavascii.gif)
+
+## Screenshots
+
+| Piped stdin: `git log --oneline \| lavascii -c green` | Text reveal: `lavascii --text poem.txt -c ember` |
+|---|---|
+| ![git log piped into lavascii](docs/screenshots/piped-stdin.png) | ![a poem revealed by the wax](docs/screenshots/text-reveal.png) |
+
+`lavascii --scheme ocean --ramp blocks`
+
+![ocean color scheme with the block glyph ramp](docs/screenshots/ocean-blocks.png)
 
 ## Install
 
-Build and install the `lavalamp` binary onto your PATH:
+lavascii is a single Rust binary. You need a Rust toolchain
+([rustup](https://rustup.rs)) to build it. Build and install the `lavascii`
+binary onto your PATH:
 
 ```sh
 cargo install --path .
@@ -16,24 +35,24 @@ cargo install --path .
 Then run it from anywhere:
 
 ```sh
-lavalamp
+lavascii
 ```
 
 Or grab a standalone binary without installing:
 
 ```sh
-cargo build --release   # -> target/release/lavalamp
+cargo build --release   # -> target/release/lavascii
 ```
 
 ## Run
 
 ```sh
-lavalamp                                  # defaults
-lavalamp --scheme ocean --speed 0.6       # calm blue lamp
-lavalamp -c ember -d 1.5 -f 60            # busy warm lamp at 60fps
-lavalamp --scheme rainbow --ramp blocks   # solid-block rainbow
-lavalamp --mono                           # no color, just glyphs
-lavalamp --text poem.txt -c ember         # wax reveals your words
+lavascii                                  # defaults
+lavascii --scheme ocean --speed 0.6       # calm blue lamp
+lavascii -c ember -d 1.5 -f 60            # busy warm lamp at 60fps
+lavascii --scheme rainbow --ramp blocks   # solid-block rainbow
+lavascii --mono                           # no color, just glyphs
+lavascii --text poem.txt -c ember         # wax reveals your words
 ```
 
 With `--text`, the file's words are laid across the screen and the flowing wax
@@ -47,18 +66,20 @@ pace with `--text-speed <rows/sec>` (`0` holds it static). The file can be a pla
 encoding — non-UTF-8 is read lossily) or a **PDF** (text is extracted
 automatically; scanned/image-only PDFs have no selectable text). Preview any
 combination without a live terminal by adding `--test`, e.g.
-`lavalamp --test --text paper.pdf`.
+`lavascii --test --text paper.pdf`.
 
-You can also feed text **live from stdin** — just pipe into `lavalamp` (or pass
-`--text -`). Incoming lines flow into a bounded ring buffer (the most recent
+### Piping text in
+
+Any text can be piped into `lavascii` (or pass `--text -`), and it is shown
+live as it arrives on stdin. Incoming lines flow into a bounded ring buffer (the most recent
 ~8 KB) and the view stays anchored to the newest lines, scrolling up like a log
 tail, so an endless feed stays light and smooth:
 
 ```sh
-echo "hello lava world" | lavalamp
-tail -f /var/log/system.log | lavalamp -c green   # watch logs goop by
-vtt-stdout | lavalamp -c ember                    # live speech-to-text
-fortune | lavalamp --scheme sunset
+echo "hello lava world" | lavascii
+tail -f /var/log/system.log | lavascii -c green   # watch logs goop by
+vtt-stdout | lavascii -c ember                    # live speech-to-text
+fortune | lavascii --scheme sunset
 ```
 
 Live inputs are cleaned before display: ANSI escape sequences and control

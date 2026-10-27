@@ -1,5 +1,5 @@
 [package]
-name = "lavalamp"
+name = "lavascii"
 version = "0.1.0"
 edition = "2021"
 description = "A full-color ASCII lava lamp for your terminal"

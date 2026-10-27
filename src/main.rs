@@ -248,8 +248,8 @@ impl TextBuffer {
 }
 
 /// Spawn a thread that reads `reader` line-by-line into the shared ring buffer.
-/// Works for both a one-shot pipe (`echo … | lavalamp`, read to EOF) and a live
-/// feed (`tail -f log | lavalamp`, or a voice-to-text stream).
+/// Works for both a one-shot pipe (`echo … | lavascii`, read to EOF) and a live
+/// feed (`tail -f log | lavascii`, or a voice-to-text stream).
 fn spawn_stdin_reader(buf: Arc<Mutex<TextBuffer>>, reader: Box<dyn io::Read + Send>) {
     std::thread::spawn(move || {
         let mut r = io::BufReader::new(reader);
@@ -371,10 +371,10 @@ impl Default for Config {
 }
 
 const HELP: &str = "\
-lavalamp — a full-color ASCII lava lamp for your terminal
+lavascii — a full-color ASCII lava lamp for your terminal
 
 USAGE:
-    lavalamp [OPTIONS]
+    lavascii [OPTIONS]
 
 OPTIONS:
     -s, --speed <F>       Simulation speed multiplier (0.1–5)     [default: 1.0]
@@ -401,11 +401,11 @@ INTERACTIVE KEYS:
     r           cycle glyph ramp     m       toggle monochrome
 
 EXAMPLES:
-    lavalamp --scheme ocean --speed 0.6
-    lavalamp -c ember -d 1.5 -f 60
-    lavalamp --scheme rainbow --ramp blocks
-    lavalamp --text poem.txt --scheme ember
-    tail -f app.log | lavalamp -c green        # live log in the wax
+    lavascii --scheme ocean --speed 0.6
+    lavascii -c ember -d 1.5 -f 60
+    lavascii --scheme rainbow --ramp blocks
+    lavascii --text poem.txt --scheme ember
+    tail -f app.log | lavascii -c green        # live log in the wax
 ";
 
 /// Load the words for `--text` from a file. Handles PDFs (extracted with a
@@ -468,7 +468,7 @@ fn parse_args() -> Result<Option<Config>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("lavalamp {}", env!("CARGO_PKG_VERSION"));
+                println!("lavascii {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "-s" | "--speed" => {
@@ -1612,7 +1612,7 @@ fn attach_text_stream(cfg: &mut Config) {
     let _ = cfg.stdin_text;
     // Whenever stdin is a pipe, move the real terminal onto fd 0 so crossterm's
     // key/resize input works (see take_piped_stdin). This must happen even when
-    // a static --text file/PDF is given (e.g. `foo | lavalamp --text bar.txt`).
+    // a static --text file/PDF is given (e.g. `foo | lavascii --text bar.txt`).
     if let Some(reader) = take_piped_stdin() {
         // Stream the piped text only if no static source takes precedence.
         if cfg.text.is_none() {
@@ -1650,13 +1650,13 @@ fn main() {
             attach_text_stream(&mut cfg);
             if let Err(e) = run_interactive(cfg) {
                 let _ = terminal::disable_raw_mode();
-                eprintln!("lavalamp: error: {e}");
+                eprintln!("lavascii: error: {e}");
                 std::process::exit(1);
             }
         }
         Ok(None) => {} // --help / --version already printed
         Err(msg) => {
-            eprintln!("lavalamp: {msg}");
+            eprintln!("lavascii: {msg}");
             std::process::exit(2);
         }
     }
