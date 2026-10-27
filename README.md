@@ -27,8 +27,13 @@ tail -f /var/log/system.log | lavascii
 **Homebrew** (macOS and Linux):
 
 ```sh
+brew tap pvbaudin/tap
+brew trust --formula pvbaudin/tap/lavascii
 brew install pvbaudin/tap/lavascii
 ```
+
+Homebrew 7 and later only load formulae from third-party taps that you have
+trusted, which is what `brew trust` does. On older Homebrew, skip that line.
 
 **Prebuilt binaries:** download a `.tar.gz` for macOS (Apple Silicon or Intel)
 or Linux (x86_64 or arm64) from the
