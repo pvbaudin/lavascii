@@ -14,9 +14,9 @@ tail -f /var/log/system.log | lavascii
 
 ## Screenshots
 
-| Piped stdin: `git log --oneline \| lavascii -c green` | Text reveal: `lavascii --text poem.txt -c ember` |
+| Piped stdin: `cat file.txt \| lavascii -c green` | Text reveal: `lavascii --text file.txt -c ember` |
 |---|---|
-| ![git log piped into lavascii](docs/screenshots/piped-stdin.png) | ![a poem revealed by the wax](docs/screenshots/text-reveal.png) |
+| ![a text file piped into lavascii](docs/screenshots/piped-stdin.png) | ![a text file revealed by the wax](docs/screenshots/text-reveal.png) |
 
 `lavascii --scheme ocean --ramp blocks`
 
