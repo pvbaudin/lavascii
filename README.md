@@ -24,11 +24,28 @@ tail -f /var/log/system.log | lavascii
 
 ## Install
 
-lavascii is a single Rust binary. You need a Rust toolchain
+**Homebrew** (macOS and Linux):
+
+```sh
+brew install pvbaudin/tap/lavascii
+```
+
+**Prebuilt binaries:** download a `.tar.gz` for macOS (Apple Silicon or Intel)
+or Linux (x86_64 or arm64) from the
+[latest release](https://github.com/pvbaudin/lavascii/releases/latest),
+unpack it, and put `lavascii` on your PATH. On Debian/Ubuntu, install the
+`.deb` instead:
+
+```sh
+sudo apt install ./lavascii_*.deb
+```
+
+**From source:** lavascii is a single Rust binary. You need a Rust toolchain
 ([rustup](https://rustup.rs)) to build it. Build and install the `lavascii`
 binary onto your PATH:
 
 ```sh
+cargo install --git https://github.com/pvbaudin/lavascii   # or, from a clone:
 cargo install --path .
 ```
 
@@ -145,3 +162,7 @@ cargo run --release -- --test
 
 Full RGB truecolor output; a 24-bit-color terminal is recommended (use `--mono`
 otherwise).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
